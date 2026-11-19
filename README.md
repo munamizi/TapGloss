@@ -14,8 +14,6 @@
 2. 在 [GitHub Releases](https://github.com/munamizi/TapGloss/releases) 的 **Assets** 下载 `TapGloss-win-x64.zip`。完整解压后会得到一个 `TapGloss` 文件夹，把整个文件夹放到常用位置，然后双击里面的 `TapGloss.exe`。
 3. 右键系统托盘中的应用图标，打开 **设置 API Key**，填入自己的 DeepSeek API Key。
 
-如果要查看或修改代码，可下载 `TapGloss-source.zip`。它用于源码开发，需要 .NET 10 SDK。构建完整运行版时，可把运行包里的 `voice` 目录传给项目的 `PiperVoiceBundle` 参数。
-
 ## 使用
 
 在浏览器或编辑器里选中英文，按 **Alt+T**。译文会在选区或光标附近弹出，点击浮窗外即可收起。
