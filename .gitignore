@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+artifacts/
+voice/
+__pycache__/
+*.user
+*.suo
+*.key
+.env
+.env.*
+*.zip
