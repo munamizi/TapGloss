@@ -95,7 +95,7 @@ public sealed class SelectionReader : IDisposable
     /// 步骤：
     ///     1. 确认来源仍在前台，并限制同时运行的读取。
     ///     2. 在后台读取 UI Automation 选区文字及可用的屏幕位置。
-    ///     3. 无法直接读取选区时，先尝试读取本次手动复制的新文本，再尝试临时复制。
+    ///     3. 在允许降级时核对本次手动复制的新文本，或为合适的来源临时复制。
     /// Args:
     ///     sourceWindow - 热键触发时记录的前台窗口句柄
     ///     clipboardWindow - 调用方持有的消息窗口句柄，用于恢复剪贴板
@@ -132,7 +132,9 @@ public sealed class SelectionReader : IDisposable
             {
                 return new(CaptureStatus.Unavailable, Detail: "读取时来源窗口已切换。");
             }
-            if (capture.Status != CaptureStatus.Unavailable || capture.FallbackMode == ClipboardFallbackMode.None)
+            bool quickProbe = capture.Status == CaptureStatus.NoSelection
+                && (previousManualSequence != 0 || ClipboardFallback._canProbeNoSelection(sourceWindow));
+            if (!quickProbe && (capture.Status != CaptureStatus.Unavailable || capture.FallbackMode == ClipboardFallbackMode.None))
             {
                 return capture;
             }
@@ -141,7 +143,7 @@ public sealed class SelectionReader : IDisposable
                 token => previousManualSequence != 0
                     ? Task.FromResult(ClipboardFallback._readManualCopy(
                         sourceWindow, clipboardWindow, previousManualSequence, sourceFocus))
-                    : ClipboardFallback._captureAsync(sourceWindow, clipboardWindow, token, sourceFocus),
+                    : ClipboardFallback._captureAsync(sourceWindow, clipboardWindow, token, sourceFocus, quickProbe),
                 cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             return fallback;
@@ -167,11 +169,16 @@ public sealed class SelectionReader : IDisposable
             return false;
         }
 
-        var className = new StringBuilder(64);
-        _getClassName(focus, className, className.Capacity);
-        string name = className.ToString();
+        string name = _getWindowClass(focus);
         return name.Equals("Edit", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // 查询原生窗口类名，句柄无效时返回空字符串。
+    internal static string _getWindowClass(nint window)
+    {
+        var className = new StringBuilder(128);
+        return window != 0 && _getClassName(window, className, className.Capacity) != 0 ? className.ToString() : "";
     }
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
@@ -214,6 +221,7 @@ public sealed class SelectionReader : IDisposable
     // 只沿焦点控件向上找文本控件，避免遍历整个窗口并读到其他位置的选区。
     internal static SelectionCapture _readSelection(nint sourceWindow)
     {
+        bool terminal = false;
         try
         {
             AutomationElement? focused = AutomationElement.FocusedElement;
@@ -224,6 +232,7 @@ public sealed class SelectionReader : IDisposable
                 {
                     return new(CaptureStatus.Protected, Detail: "此控件包含受保护文本。");
                 }
+                terminal |= _isAutomationTerminal(element, depth == 0);
                 if (element.TryGetCurrentPattern(TextPattern.Pattern, out object pattern)
                     && pattern is TextPattern textPattern
                     && textPattern.SupportedTextSelection != SupportedTextSelection.None)
@@ -255,23 +264,61 @@ public sealed class SelectionReader : IDisposable
                     {
                         return new(CaptureStatus.Unavailable, Detail: "读取时输入焦点已切换。");
                     }
-                    return text.Length == 0
-                        ? new(CaptureStatus.NoSelection)
-                        : new(CaptureStatus.Selected, text) { SelectionBounds = bounds };
+                    if (text.Length == 0)
+                    {
+                        return terminal ? _terminalNeedsSelection() : new(CaptureStatus.NoSelection);
+                    }
+                    return new(CaptureStatus.Selected, text) { SelectionBounds = bounds };
                 }
                 element = TreeWalker.ControlViewWalker.GetParent(element);
             }
-            return _automationUnavailable(null);
+            if (!terminal)
+            {
+                return _automationUnavailable(null);
+            }
         }
         catch (ElementNotAvailableException)
         {
-            return _automationUnavailable("来源控件已关闭或切换。");
+            if (!terminal)
+            {
+                return _automationUnavailable("来源控件已关闭或切换。");
+            }
         }
         catch (Exception ex) when (ex is COMException or InvalidOperationException)
         {
-            return _automationUnavailable("来源应用的选区接口不可访问。");
+            if (!terminal)
+            {
+                return _automationUnavailable("来源应用的选区接口不可访问。");
+            }
+        }
+        return _terminalNeedsSelection();
+    }
+
+    // 用焦点链上可识别的终端控件类或焦点输入框名称保护内嵌终端。
+    private static bool _isAutomationTerminal(AutomationElement element, bool focused)
+    {
+        try
+        {
+            return _matchesTerminalControl(element.Current.ClassName, focused ? element.Current.Name : "");
+        }
+        catch (Exception ex) when (ex is COMException or ElementNotAvailableException or InvalidOperationException)
+        {
+            return false;
         }
     }
+
+    // 匹配已知的终端界面标记，避免根据文档或窗口标题猜测终端。
+    internal static bool _matchesTerminalControl(string className, string focusedName) =>
+        className.Equals("xterm", StringComparison.OrdinalIgnoreCase)
+        || className.StartsWith("xterm-", StringComparison.OrdinalIgnoreCase)
+        || className.StartsWith("xterm ", StringComparison.OrdinalIgnoreCase)
+        || className.Equals("JediTermPanel", StringComparison.OrdinalIgnoreCase)
+        || focusedName.Equals("Terminal input", StringComparison.OrdinalIgnoreCase)
+        || focusedName == "终端输入";
+
+    // 终端没有 UIA 选区时停止，不发送可能中断命令的 Ctrl+C。
+    internal static SelectionCapture _terminalNeedsSelection() =>
+        new(CaptureStatus.Unavailable, Detail: "终端没有提供可读取的选区。为避免中断命令，已停止自动复制。");
 
     // UIA 无法取得结果时交给剪贴板，取词入口会再次核对来源，复制前会复查原生密码框。
     internal static SelectionCapture _automationUnavailable(string? detail) =>

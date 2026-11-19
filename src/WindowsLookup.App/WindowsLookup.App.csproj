@@ -16,7 +16,7 @@
     <AssemblyName>TapGloss</AssemblyName>
     <AssemblyTitle>TapGloss</AssemblyTitle>
     <Product>TapGloss</Product>
-    <Version>0.5.9</Version>
+    <Version>0.5.10</Version>
     <Description>TapGloss</Description>
   </PropertyGroup>
   <ItemGroup>
