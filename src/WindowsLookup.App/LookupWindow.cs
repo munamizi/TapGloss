@@ -3,6 +3,7 @@ using Rectangle = System.Drawing.Rectangle;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -24,6 +25,9 @@ internal sealed partial class LookupWindow : Window
     private const uint ForegroundChanged = 0x0003;
     private const uint WindowCloaked = 0x8017;
     private const uint WindowUncloaked = 0x8018;
+    private const string CopyGlyph = "\uE8C8";
+    private const string CopiedGlyph = "\uE73E";
+    private const string CopyLabel = "复制译文";
     private readonly nint _desktopOwner;
     private readonly OutsideClickWatcher _outsideClicks;
     private readonly DispatcherQueueTimer? _desktopWatcher;
@@ -35,6 +39,11 @@ internal sealed partial class LookupWindow : Window
     private readonly TextBlock _heading = new() { IsTextSelectionEnabled = true };
     private readonly TextBlock _body = new() { IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap };
     private readonly Button _speak = new();
+    private readonly Button _copy = new() { Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center };
+    private readonly FontIcon _copyIcon = new() { Glyph = CopyGlyph, FontSize = 12 };
+    private readonly DispatcherQueueTimer _copyFeedbackTimer;
+    private Func<CancellationToken, Task<bool>>? _copyAction;
+    private CancellationTokenSource? _copyRequest;
     private readonly TextBlock _notice = new() { Visibility = Visibility.Collapsed };
     private Action? _speakAction;
     private Point _lastAnchor;
@@ -88,9 +97,14 @@ internal sealed partial class LookupWindow : Window
             };
         }
 
+        _copyFeedbackTimer = DispatcherQueue.CreateTimer();
+        _copyFeedbackTimer.Interval = TimeSpan.FromMilliseconds(1200);
+        _copyFeedbackTimer.IsRepeating = false;
+        _copyFeedbackTimer.Tick += (_, _) => _resetCopyFeedback();
         Content = _buildLayout();
         SystemBackdrop = new MicaBackdrop();
         _speak.Click += (_, _) => _speakAction?.Invoke();
+        _copy.Click += (_, _) => _ = _copyResultAsync();
         AppWindow.Closing += (_, args) =>
         {
             if (!_closing)
@@ -109,8 +123,15 @@ internal sealed partial class LookupWindow : Window
 
     // 更新本次状态与操作，按内容自适应窗口宽高并保留原应用焦点。
     internal void _display(Point anchor, string heading, string body, Action? speak = null,
-        Rectangle? selectionBounds = null)
+        Rectangle? selectionBounds = null, Func<CancellationToken, Task<bool>>? copy = null)
     {
+        _resetCopyState();
+        _copyAction = copy;
+        if (copy is not null)
+        {
+            _copy.Visibility = Visibility.Visible;
+            _statusTop.ColumnSpacing = CopyColumnSpacing;
+        }
         _lastAnchor = anchor;
         _lastSelectionBounds = selectionBounds;
         _scroll.ChangeView(null, 0, null, disableAnimation: true);
@@ -301,6 +322,7 @@ internal sealed partial class LookupWindow : Window
     // 收起浮窗并清理本次交互，包括已被系统遮蔽的浮窗。
     internal void _hide()
     {
+        _resetCopyState();
         _stopDesktopTracking();
         _outsideClicks._stop();
         _loadingRing.IsActive = false;
@@ -312,7 +334,85 @@ internal sealed partial class LookupWindow : Window
         _speakAction = null;
     }
 
-    // 在操作区旁显示语音错误，并按需重新适配窗口尺寸以保证提示完整可见。
+    // 复制由用户点击触发，换结果或关窗时取消尚未开始的写入并忽略旧反馈。
+    private async Task _copyResultAsync()
+    {
+        if (_copyAction is not { } copy || _copyRequest is not null)
+        {
+            return;
+        }
+        using var request = new CancellationTokenSource();
+        _copyRequest = request;
+        bool copied = false;
+        try
+        {
+            copied = await copy(request.Token);
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception error)
+        {
+            Trace.TraceWarning("复制译文失败（{0}）。", error.GetType().Name);
+        }
+        finally
+        {
+            if (ReferenceEquals(_copyRequest, request))
+            {
+                _copyRequest = null;
+            }
+        }
+
+        if (request.IsCancellationRequested || !IsVisible)
+        {
+            return;
+        }
+        try
+        {
+            _resetCopyFeedback();
+            if (!copied)
+            {
+                _showNotice("无法复制译文，剪贴板正被占用。");
+                return;
+            }
+            _copyIcon.Glyph = CopiedGlyph;
+            ToolTipService.SetToolTip(_copy, "已复制");
+            _copyFeedbackTimer.Start();
+            if (_notice.Visibility == Visibility.Visible)
+            {
+                _notice.Visibility = Visibility.Collapsed;
+                _actions.Visibility = Visibility.Collapsed;
+                _placeWithFittedSize(_lastAnchor);
+            }
+        }
+        catch (Exception error)
+        {
+            Trace.TraceWarning("复制状态显示失败（{0}）。", error.GetType().Name);
+        }
+    }
+
+    // 停止旧结果的复制回调、反馈和按钮命中区。
+    private void _resetCopyState()
+    {
+        _copyRequest?.Cancel();
+        _copyRequest = null;
+        _copyAction = null;
+        _copy.Visibility = Visibility.Collapsed;
+        _statusTop.ColumnSpacing = 0;
+        _nonClientPointer?.ClearRegionRects(NonClientRegionKind.Passthrough);
+        _resetCopyFeedback();
+    }
+
+    // 恢复复制图标和提示，无需重新显示或关闭浮窗。
+    private void _resetCopyFeedback()
+    {
+        _copyFeedbackTimer.Stop();
+        _copyIcon.Glyph = CopyGlyph;
+        ToolTipService.SetToolTip(_copy, CopyLabel);
+    }
+
+    // 在操作区旁显示错误，并按需重新适配窗口尺寸以保证提示完整可见。
     internal void _showNotice(string message)
     {
         _notice.Text = message;
@@ -327,6 +427,7 @@ internal sealed partial class LookupWindow : Window
     // 先关 WinUI 浮窗，再销毁同线程的隐藏宿主。
     internal void _close()
     {
+        _resetCopyState();
         _stopDesktopTracking();
         _outsideClicks.Dispose();
         _root.LayoutUpdated -= _syncDragRegionAfterLayout;
@@ -433,6 +534,7 @@ internal sealed partial class LookupWindow : Window
     private int _measureTargetWidth()
     {
         double maxInner = MaxCardWidth - HorizontalPadding;
+        // 状态标题所在的 Grid 会同时测量可见的复制按钮和列间距。
         _headerHost.Measure(new Windows.Foundation.Size(maxInner, double.PositiveInfinity));
         double headerWidth = _headerHost.DesiredSize.Width;
 

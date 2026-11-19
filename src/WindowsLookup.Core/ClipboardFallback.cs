@@ -14,8 +14,8 @@ internal enum EditorCopySelection
     Ambiguous,
 }
 
-/// <summary>尽力备份剪贴板的常见格式，临时复制并核对本次取得的新文字。</summary>
-internal static class ClipboardFallback
+/// <summary>临时复制和恢复剪贴板以读取选区，也可写入用户主动复制的译文。</summary>
+public static class ClipboardFallback
 {
     private const uint UnicodeText = 13;
     private const uint BitmapFormat = 2;
@@ -32,7 +32,8 @@ internal static class ClipboardFallback
     private const uint KeyUp = 2;
     private const ushort Control = 0x11;
     private const ushort CopyKey = 0x43;
-    private static readonly int[] TriggerKeys = [0x10, 0x11, 0x12, 0x5B, 0x5C, 0x54, CopyKey];
+    private const ushort MenuMaskKey = 0xe8;
+    private static readonly int[] TriggerKeys = [0x10, 0x11, 0x12, 0x5B, 0x5C, 0x54, 0x52, CopyKey];
     private static readonly HashSet<string> TerminalProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
         "WindowsTerminal", "WindowsTerminalPreview", "OpenConsole", "conhost", "cmd", "powershell", "pwsh",
@@ -63,9 +64,123 @@ internal static class ClipboardFallback
     };
     private static readonly SemaphoreSlim ClipboardGate = new(1);
 
+    /// <summary>
+    /// 将译文作为独立的 Unicode 文本写入 Windows 剪贴板。
+    ///
+    /// 步骤：
+    ///     1. 等取词或上一次写入释放剪贴板操作权。
+    ///     2. 打开剪贴板，被占用时最多重试三次，间隔 15 毫秒。
+    ///     3. 写入文本并把内存交给 Windows，应用退出后也能粘贴。
+    /// Args:
+    ///     clipboardWindow - 可作为剪贴板所有者的窗口句柄，必须在写入结束前保持有效
+    ///     text - 要写入的非空译文，可包含换行
+    ///     cancellationToken - 取消等待和重试，开始写入后完成本次操作
+    /// Returns:
+    ///     bool - 成功写入时为 true，窗口无效、文本无法写入或剪贴板持续被占用时为 false。
+    /// </summary>
+    public static Task<bool> CopyTextAsync(nint clipboardWindow, string text, CancellationToken cancellationToken = default) =>
+        _copyTextAsync(clipboardWindow, text, cancellationToken, _tryWriteUnicodeText);
+
+    // 取词恢复和用户主动复制共用一把锁，锁内尝试打开并写入剪贴板。
+    internal static Task<bool> _copyTextAsync(nint clipboardWindow, string text, CancellationToken token,
+        Func<nint, string, bool?> tryWrite)
+    {
+        if (clipboardWindow == 0 || string.IsNullOrEmpty(text) || text.Contains('\0'))
+        {
+            return Task.FromResult(false);
+        }
+
+        return Task.Run(async () =>
+        {
+            await ClipboardGate.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                for (int attempt = 0; attempt <= 3; attempt++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (tryWrite(clipboardWindow, text) is bool copied)
+                    {
+                        return copied;
+                    }
+                    if (attempt < 3)
+                    {
+                        await Task.Delay(15, token).ConfigureAwait(false);
+                    }
+                }
+                return false;
+            }
+            finally
+            {
+                ClipboardGate.Release();
+            }
+        });
+    }
+
+    // 无法打开时返回 null 供调用方重试；打开和关闭在同一线程完成。
+    private static bool? _tryWriteUnicodeText(nint window, string text)
+    {
+        if (!_openClipboard(window))
+        {
+            return null;
+        }
+        try
+        {
+            return _writeUnicodeText(text, _emptyClipboard, _setClipboardData);
+        }
+        finally
+        {
+            _closeClipboard();
+        }
+    }
+
+    // 先统一换行并准备带终止符的内存，再写入剪贴板并将句柄交给 Windows。
+    internal static bool _writeUnicodeText(string text, Func<bool> empty, Func<uint, nint, nint> set)
+    {
+        text = text.ReplaceLineEndings("\r\n");
+        int terminator = checked(text.Length * sizeof(char));
+        nint memory = _globalAlloc(2, (nuint)terminator + sizeof(char));
+        if (memory == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            nint data = _globalLock(memory);
+            if (data == 0)
+            {
+                return false;
+            }
+            try
+            {
+                Marshal.Copy(text.ToCharArray(), 0, data, text.Length);
+                Marshal.WriteInt16(data, terminator, 0);
+            }
+            finally
+            {
+                _globalUnlock(memory);
+            }
+
+            if (!empty() || set(UnicodeText, memory) == 0 && set(UnicodeText, memory) == 0)
+            {
+                return false;
+            }
+            memory = 0;
+            return true;
+        }
+        finally
+        {
+            if (memory != 0)
+            {
+                _globalFree(memory);
+            }
+        }
+    }
+
     // 为查词限时，已开始的复制仍由后台收尾，其间不允许另一笔操作改动剪贴板。
     internal static async Task<SelectionCapture> _withClipboardBudgetAsync(
-        Func<CancellationToken, Task<SelectionCapture>> action, CancellationToken cancellationToken)
+        Func<CancellationToken, Task<SelectionCapture>> action, CancellationToken cancellationToken,
+        string shortcutLabel = "Alt+T")
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!ClipboardGate.Wait(0))
@@ -106,7 +221,7 @@ internal static class ClipboardFallback
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return new(CaptureStatus.Unavailable, Detail: "剪贴板处理超时，请稍后再按 Alt+T。");
+            return new(CaptureStatus.Unavailable, Detail: $"剪贴板处理超时，请稍后再按 {shortcutLabel}。");
         }
         finally
         {
@@ -141,16 +256,17 @@ internal static class ClipboardFallback
         ClipboardGate.Release();
     }
 
-    // 先备份可独立还原的格式，再复制。发送后完成读取和恢复才响应取消。
+    // 松键后备份并锁定来源焦点；发键后只按锁定的来源读取和恢复。
     internal static async Task<SelectionCapture> _captureAsync(nint sourceWindow, nint clipboardWindow,
-        CancellationToken cancellationToken, nint sourceFocus = 0, bool quickProbe = false)
+        CancellationToken cancellationToken, nint sourceFocus = 0, bool quickProbe = false,
+        Func<CancellationToken, Task<SelectionCapture>>? recheckFocus = null)
     {
         if (_isTerminalSource(sourceWindow, sourceFocus))
         {
             return SelectionReader._terminalNeedsSelection();
         }
 
-        for (int attempt = 0; TriggerKeys.Any(_isPressed); attempt++)
+        for (int attempt = 0; _isTriggerKeyPressed(_isPressed); attempt++)
         {
             if (attempt == 75)
             {
@@ -163,95 +279,229 @@ internal static class ClipboardFallback
         {
             return new(CaptureStatus.Unavailable, Detail: "无法取得剪贴板，请稍后重试。");
         }
-        for (int attempt = 0; !_openClipboard(clipboardWindow); attempt++)
+
+        nint verifiedFocus = sourceFocus;
+        bool rechecked = false;
+        return await _withFreshSnapshotAsync(
+            () => _takeSnapshotAsync(sourceWindow, clipboardWindow, cancellationToken),
+            _tryCopyAsync, _freeBackup, cancellationToken).ConfigureAwait(false);
+
+        // 返回 null 仅表示尚未发键且序列已变化，外层可重新备份。
+        async Task<SelectionCapture?> _tryCopyAsync(List<(uint Format, nint Handle)> data, uint sequence)
         {
-            if (attempt == 2)
+            if (_checkCopySource(sourceWindow, out nint focus) is { } issue)
             {
-                return new(CaptureStatus.Unavailable, Detail: "剪贴板正被占用，请稍后重试。");
+                return issue;
             }
-            await Task.Delay(15, cancellationToken).ConfigureAwait(false);
-        }
-        uint previousSequence;
-        List<(uint Format, nint Handle)>? previousData;
-        string? snapshotError;
-        try
-        {
-            previousData = _snapshot(out snapshotError, cancellationToken);
-            previousSequence = _sequence();
-        }
-        finally
-        {
-            _closeClipboard();
-        }
-        if (previousData is null)
-        {
-            return previousSequence == 0
-                ? new(CaptureStatus.Unavailable, Detail: snapshotError)
-                : new(CaptureStatus.NeedsManualCopy, Detail: snapshotError) { ClipboardSequence = previousSequence };
-        }
-        try
-        {
-            if (previousSequence == 0)
+            if (focus != verifiedFocus)
             {
-                return new(CaptureStatus.Unavailable, Detail: "Windows 未提供当前剪贴板的序列号。");
+                if (focus == 0 || rechecked || recheckFocus is null)
+                {
+                    return _unverifiedFocus();
+                }
+
+                rechecked = true;
+                SelectionCapture updated = await recheckFocus(cancellationToken).ConfigureAwait(false);
+                if (_checkCopySource(sourceWindow, out nint currentFocus) is { } recheckIssue)
+                {
+                    return recheckIssue;
+                }
+                if (currentFocus != focus)
+                {
+                    return _unverifiedFocus();
+                }
+                if (_afterFocusRecheck(updated, () => _canProbeNoSelection(sourceWindow), out quickProbe) is { } result)
+                {
+                    return result;
+                }
+                verifiedFocus = focus;
             }
-            cancellationToken.ThrowIfCancellationRequested();
+
             uint sourceProcess = _getProcess(sourceWindow);
             if (sourceProcess == 0)
             {
                 return new(CaptureStatus.Unavailable, Detail: "来源窗口已关闭。");
             }
-            sourceFocus = sourceFocus == 0 ? WindowsHotkey.GetFocusedWindow(sourceWindow) : sourceFocus;
-            uint contentProcess = _getContentProcess(sourceWindow, sourceFocus, sourceProcess);
-            if (_isTerminalSource(sourceWindow, sourceFocus))
+            uint contentProcess = _getContentProcess(sourceWindow, verifiedFocus, sourceProcess);
+            if (_checkCopySource(sourceWindow, out nint sendFocus) is { } finalIssue)
             {
-                return SelectionReader._terminalNeedsSelection();
+                return finalIssue;
             }
-            if (!SelectionReader._isCurrentSource(sourceWindow, sourceFocus) || previousSequence != _sequence())
+            if (sendFocus != verifiedFocus)
             {
-                return new(CaptureStatus.Unavailable, Detail: "来源窗口或剪贴板已变化。");
+                return _unverifiedFocus();
             }
-            if (SelectionReader._isNativePassword(sourceFocus))
+            if (_isTriggerKeyPressed(_isPressed))
             {
-                return new(CaptureStatus.Protected, Detail: "此控件包含受保护文本。");
+                return new(CaptureStatus.Unavailable, Detail: "请松开快捷键后重新取词。");
             }
             cancellationToken.ThrowIfCancellationRequested();
-            Input[] down = [_key(Control, 0), _key(CopyKey, 0)];
-            Input[] up = [_key(CopyKey, KeyUp), _key(Control, KeyUp)];
-            int inputSize = Marshal.SizeOf<Input>();
-            long sentAt = Stopwatch.GetTimestamp();
-            // 一旦发送按下，就完成释放和剪贴板收尾，即使调用方已取消等待。
-            (bool pressed, bool released) = await _sendCopyChordAsync(
-                keyUp => _sendInput(2, keyUp ? up : down, inputSize), () => Task.Delay(15)).ConfigureAwait(false);
-            if (!pressed)
+            if (sequence != _sequence())
             {
-                return new(CaptureStatus.Unavailable, Detail: "来源应用未接受复制。");
+                return null;
+            }
+            return await _copyAndRestoreAsync(sourceWindow, clipboardWindow, sendFocus, sourceProcess,
+                contentProcess, sequence, data, quickProbe).ConfigureAwait(false);
+        }
+    }
+
+    // 旧备份先释放，最多等待并重取一次。发键后的任何结果都不再重试。
+    internal static async Task<SelectionCapture> _withFreshSnapshotAsync(
+        Func<Task<(List<(uint Format, nint Handle)>? Data, uint Sequence, SelectionCapture? Error)>> takeSnapshot,
+        Func<List<(uint Format, nint Handle)>, uint, Task<SelectionCapture?>> tryCopy,
+        Action<List<(uint Format, nint Handle)>> freeBackup, CancellationToken token)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            var (data, sequence, error) = await takeSnapshot().ConfigureAwait(false);
+            if (data is null)
+            {
+                return error!;
             }
 
-            TimeSpan receiveBudget = _receiveBudget(quickProbe, previousData.Count > 0);
-            do
+            try
             {
-                uint observedSequence = _sequence();
-                if (observedSequence != 0 && observedSequence != previousSequence && _openClipboard(clipboardWindow))
+                if (sequence == 0)
                 {
-                    try
-                    {
-                        return _readAndRestore(previousSequence, observedSequence, previousData, sourceWindow, sourceFocus,
-                            sourceProcess, contentProcess, sentAt, released);
-                    }
-                    finally
-                    {
-                        _closeClipboard();
-                    }
+                    return new(CaptureStatus.Unavailable, Detail: "Windows 未提供当前剪贴板的序列号。");
                 }
-                await Task.Delay(15).ConfigureAwait(false);
-            } while (Stopwatch.GetElapsedTime(sentAt) < receiveBudget);
-            return new(CaptureStatus.NoSelection, Detail: "来源应用没有返回新的剪贴板文字。");
+                if (await tryCopy(data, sequence).ConfigureAwait(false) is { } result)
+                {
+                    return result;
+                }
+            }
+            finally
+            {
+                freeBackup(data);
+            }
+
+            if (attempt == 0)
+            {
+                await Task.Delay(28, token).ConfigureAwait(false);
+            }
+        }
+        return new(CaptureStatus.Unavailable, Detail: "剪贴板在取词前发生变化，请重试。");
+    }
+
+    // 打开剪贴板后在同一线程完成备份、记录序列号和关锁。
+    private static async Task<(List<(uint Format, nint Handle)>? Data, uint Sequence, SelectionCapture? Error)>
+        _takeSnapshotAsync(nint sourceWindow, nint clipboardWindow, CancellationToken token)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            if (_checkCopySource(sourceWindow, out _) is { } issue)
+            {
+                return (null, 0, issue);
+            }
+            if (_openClipboard(clipboardWindow))
+            {
+                break;
+            }
+            if (attempt == 2)
+            {
+                return (null, 0, new(CaptureStatus.Unavailable, Detail: "剪贴板正被占用，请稍后重试。"));
+            }
+            await Task.Delay(15, token).ConfigureAwait(false);
+        }
+
+        try
+        {
+            var data = _snapshot(out string? error, token);
+            uint sequence = _sequence();
+            if (data is not null)
+            {
+                return (data, sequence, null);
+            }
+            var status = sequence == 0 ? CaptureStatus.Unavailable : CaptureStatus.NeedsManualCopy;
+            return (null, sequence, new(status, Detail: error) { ClipboardSequence = sequence });
         }
         finally
         {
-            _freeBackup(previousData);
+            _closeClipboard();
         }
+    }
+
+    // 有新焦点就要求 UIA 已成功检查安全边界，直接读到的结果无需再复制。
+    internal static SelectionCapture? _afterFocusRecheck(SelectionCapture capture, Func<bool> canProbeNoSelection,
+        out bool quickProbe)
+    {
+        quickProbe = capture.Status == CaptureStatus.NoSelection && canProbeNoSelection();
+        if (quickProbe || capture.FallbackMode == ClipboardFallbackMode.Automatic)
+        {
+            return capture.AutomationFocusChecked ? null : _unverifiedFocus();
+        }
+        return capture;
+    }
+
+    // 前台顶层窗口、菜单和原生焦点必须仍在允许发键的状态。
+    private static SelectionCapture? _checkCopySource(nint source, out nint focus)
+    {
+        focus = 0;
+        if (!SelectionReader._isCurrentSource(source, 0))
+        {
+            return new(CaptureStatus.Unavailable, Detail: "来源窗口已切换。");
+        }
+        if (!WindowsHotkey._tryGetFocusState(source, out focus, out bool inMenu)
+            || focus != 0 && !_isFocusInSource(source, focus))
+        {
+            return _unverifiedFocus();
+        }
+        if (inMenu)
+        {
+            return new(CaptureStatus.Unavailable, Detail: "来源窗口正在使用菜单，请返回选区后重试。");
+        }
+        if (SelectionReader._isNativePassword(focus))
+        {
+            return new(CaptureStatus.Protected, Detail: "此控件包含受保护文本。");
+        }
+        return _isTerminalSource(source, focus) ? SelectionReader._terminalNeedsSelection() : null;
+    }
+
+    // 只有同一顶层窗口内的非空焦点才有资格替代原焦点。
+    internal static bool _isFocusInSource(nint source, nint focus) =>
+        source != 0 && focus != 0 && _getAncestor(focus, RootWindow) == source;
+
+    // 焦点改变后无法确认安全性，不向该控件发键。
+    internal static SelectionCapture _unverifiedFocus() =>
+        new(CaptureStatus.Unavailable, Detail: "来源窗口内的输入焦点已切换，请重新选中文字后重试。");
+
+    // 一旦发键，不受外层取消影响，完成按键释放和剪贴板读取与恢复。
+    private static async Task<SelectionCapture> _copyAndRestoreAsync(nint sourceWindow, nint clipboardWindow,
+        nint sourceFocus, uint sourceProcess, uint contentProcess, uint previousSequence,
+        List<(uint Format, nint Handle)> previousData, bool quickProbe)
+    {
+        Input[] down = [_key(Control, 0), _key(CopyKey, 0)];
+        Input[] up = [_key(CopyKey, KeyUp), _key(Control, KeyUp)];
+        int inputSize = Marshal.SizeOf<Input>();
+        long sentAt = Stopwatch.GetTimestamp();
+        (bool pressed, bool released) = await _sendCopyChordAsync(
+            keyUp => _sendInput(2, keyUp ? up : down, inputSize), () => Task.Delay(15)).ConfigureAwait(false);
+        if (!pressed)
+        {
+            return new(CaptureStatus.Unavailable, Detail: "来源应用未接受复制。");
+        }
+
+        TimeSpan receiveBudget = _receiveBudget(quickProbe, previousData.Count > 0);
+        do
+        {
+            uint observedSequence = _sequence();
+            if (observedSequence != 0 && observedSequence != previousSequence && _openClipboard(clipboardWindow))
+            {
+                try
+                {
+                    return _readAndRestore(previousSequence, observedSequence, previousData, sourceWindow, sourceFocus,
+                        sourceProcess, contentProcess, sentAt, released);
+                }
+                finally
+                {
+                    _closeClipboard();
+                }
+            }
+            await Task.Delay(15).ConfigureAwait(false);
+        } while (Stopwatch.GetElapsedTime(sentAt) < receiveBudget);
+        return new(CaptureStatus.NoSelection, Detail: "来源应用没有返回新的剪贴板文字。");
     }
 
     // UIA 空选区的探测短等一次，常规回退根据是否有备份为慢应用留出时间。
@@ -349,7 +599,7 @@ internal static class ClipboardFallback
         nint clipboardOwner = _clipboardOwner();
         uint clipboardProcess = _getProcess(clipboardOwner);
         uint currentSequence = _sequence();
-        bool sourceIsCurrent = SelectionReader._isCurrentSource(sourceWindow, sourceFocus);
+        bool sourceIsCurrent = SelectionReader._isCurrentSource(sourceWindow, sourceFocus, strictFocus: true);
         // 没有所有者可核对时，只接受在发键后立即出现、焦点可核对且未被再次更改的新文本。
         bool promptUnownedCopy = clipboardOwner == 0 && sourceIsCurrent && sourceFocus != 0 && fullShortcutSent
             && _isPromptUnownedCopy(previousSequence, observedSequence, currentSequence, Stopwatch.GetElapsedTime(sentAt))
@@ -380,15 +630,17 @@ internal static class ClipboardFallback
         }
         finally
         {
-            if (!promptUnownedCopy || SelectionReader._isCurrentSource(sourceWindow, sourceFocus))
+            if (SelectionReader._isCurrentSource(sourceWindow, sourceFocus, strictFocus: true)
+                || !promptUnownedCopy && _canRestoreAfterFocusChange(clipboardOwner, sourceWindow, sourceFocus))
             {
                 restored = _restore(previousData);
             }
         }
 
-        if (!sourceIsCurrent || !SelectionReader._isCurrentSource(sourceWindow, sourceFocus))
+        if (!sourceIsCurrent || !SelectionReader._isCurrentSource(sourceWindow, sourceFocus, strictFocus: true))
         {
-            return new(CaptureStatus.Unavailable, Detail: "读取时来源窗口已切换。");
+            return new(CaptureStatus.Unavailable, Detail: SelectionReader._isCurrentSource(sourceWindow, 0)
+                ? "读取时输入焦点已切换。" : "来源窗口已切换。");
         }
         if (!restored)
         {
@@ -470,6 +722,9 @@ internal static class ClipboardFallback
     // 识别不了整行标记的编辑器，优先信任 UIA 已经判断出的空选区。
     internal static bool _canProbeNoSelection(string name) =>
         !_isTerminalProcess(name) && (!_isLineCopyEditor(name) || _hasEditorCopyMarker(name));
+
+    // 只有已知的 VS Code 系应用使用编号开头的终端输入框标签。
+    internal static bool _isVsCodeEditor(nint window) => VsCodeEditors.Contains(_processName(_getProcess(window)));
 
     // 按前台窗口的进程名决定是否进行空选区探测。
     internal static bool _canProbeNoSelection(nint window) =>
@@ -904,8 +1159,23 @@ internal static class ClipboardFallback
         }
     }
 
-    /// <summary>检查虚拟键当前是否处于按下状态。</summary>
-    private static bool _isPressed(int key) => (_getAsyncKeyState(key) & 0x8000) != 0;
+    // Ctrl+C 发送前等待修饰键、查词快捷键的主键和 C 全部松开。
+    internal static bool _isTriggerKeyPressed(Func<int, bool> isPressed) => TriggerKeys.Any(isPressed);
+
+    // 检查虚拟键当前是否处于按下状态。
+    internal static bool _isPressed(int key) => (_getAsyncKeyState(key) & 0x8000) != 0;
+
+    // 未分配虚拟键与按住的 Alt 构成组合键；若 Windows 只接受了按下，就补发释放。
+    internal static void _maskAltMenu()
+    {
+        Input down = _key(MenuMaskKey, 0);
+        Input up = _key(MenuMaskKey, KeyUp);
+        int size = Marshal.SizeOf<Input>();
+        if (_sendInput(2, [down, up], size) == 1)
+        {
+            _sendInput(1, [up], size);
+        }
+    }
 
     /// <summary>构造一条 Windows 键盘输入记录。</summary>
     private static Input _key(ushort key, uint flags) => new()

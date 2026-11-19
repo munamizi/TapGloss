@@ -8,10 +8,21 @@ using System.Text.RegularExpressions;
 
 namespace WindowsLookup;
 
-/// <summary>单词结果可带美式音标，短语和句子只有中文译文。</summary>
+/// <summary>指定查词结果的目标语言。</summary>
+public enum TranslationDirection
+{
+    ToChinese,
+    ToEnglish,
+}
+
+/// <summary>译文及其方向，英译中单词可附美式音标。</summary>
 public sealed record LookupResult(string Source, string Chinese, string? AmericanIpa)
 {
     public bool IsWord { get; init; } = AmericanIpa is not null;
+    public TranslationDirection Direction { get; init; } = TranslationDirection.ToChinese;
+
+    /// <summary>按当前方向返回译文，沿用原构造函数的 Chinese 字段存储。</summary>
+    public string Text => Chinese;
 }
 
 /// <summary>翻译失败的可展示提示，以及服务返回的 HTTP 状态码。</summary>
@@ -64,7 +75,8 @@ public sealed partial class DeepSeekClient
     private readonly HttpClient _http;
     private readonly TimeProvider _clock;
     private readonly object _cacheLock = new();
-    private readonly Dictionary<string, (LookupResult Result, long WrittenAt)> _cachedTranslations = new(StringComparer.Ordinal);
+    private readonly Dictionary<(TranslationDirection Direction, string Text), (LookupResult Result, long WrittenAt)>
+        _cachedTranslations = new();
     private string? _cacheKey;
 
     /// <summary>
@@ -122,21 +134,35 @@ public sealed partial class DeepSeekClient
     }
 
     /// <summary>
-    /// 查找本次取到的英文的简体中文译文，单词可带美式音标。
+    /// 使用原有签名将选区翻译为简体中文。
+    ///
+    /// Args:
+    ///     selection - 已取得的待译选区
+    ///     apiKey - 当前用户的 DeepSeek API Key
+    ///     cancellationToken - 用于取消本次查询及重试
+    /// Returns:
+    ///     LookupResult - 中文译文，英文单词可带美式音标。
+    /// </summary>
+    public Task<LookupResult> TranslateAsync(SelectionCapture selection, string apiKey, CancellationToken cancellationToken) =>
+        TranslateAsync(selection, apiKey, cancellationToken, TranslationDirection.ToChinese);
+
+    /// <summary>
+    /// 按指定方向翻译本次取得的选区，英译中单词可带美式音标。
     ///
     /// 步骤：
-    ///     1. 校验选区和密钥，整理单词选区并尝试复用未过期的译文。
+    ///     1. 校验选区和密钥，整理英译中单词，并按方向尝试复用未过期的译文。
     ///     2. 在 12 秒总预算内调用 DeepSeek，遇到可恢复的故障时最多重试一次。
-    ///     3. 返回按规则整理的译文，并在内存中最多保留 128 条结果。单词缓存 10 分钟。
+    ///     3. 返回译文，并在内存中最多保留 128 条结果。英译中单词缓存 10 分钟。
     /// Args:
     ///     selection - 直接取得的选区，或本次从原应用复制到的新文字
     ///     apiKey - 当前用户的 DeepSeek API Key
     ///     cancellationToken - 用于取消本次查询及重试
+    ///     direction - 目标语言，默认翻译为简体中文
     /// Returns:
-    ///     LookupResult - 原文、中文译文、是否为单词及可用的美式音标。
+    ///     LookupResult - 原文、译文和翻译方向，英译中单词可带美式音标。
     /// </summary>
     public async Task<LookupResult> TranslateAsync(SelectionCapture selection, string apiKey,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, TranslationDirection direction = TranslationDirection.ToChinese)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (selection.Status is not (CaptureStatus.Selected or CaptureStatus.Copied))
@@ -154,9 +180,10 @@ public sealed partial class DeepSeekClient
         }
         string key = apiKey.Trim();
 
-        string? word = _getWord(text);
+        string? word = direction == TranslationDirection.ToChinese ? _getWord(text) : null;
         bool isWord = word is not null;
         text = word ?? text;
+        var cacheEntry = (Direction: direction, Text: text);
         lock (_cacheLock)
         {
             if (!string.Equals(_cacheKey, key, StringComparison.Ordinal))
@@ -164,26 +191,26 @@ public sealed partial class DeepSeekClient
                 _cachedTranslations.Clear();
                 _cacheKey = key;
             }
-            if (_cachedTranslations.TryGetValue(text, out var cached))
+            if (_cachedTranslations.TryGetValue(cacheEntry, out var cached))
             {
                 if (!isWord || _clock.GetElapsedTime(cached.WrittenAt) < WordCacheLifetime)
                 {
                     return cached.Result;
                 }
-                _cachedTranslations.Remove(text);
+                _cachedTranslations.Remove(cacheEntry);
             }
         }
 
-        LookupResult result = await _requestTranslationAsync(text, isWord, key, cancellationToken)
+        LookupResult result = await _requestTranslationAsync(text, isWord, direction, key, cancellationToken)
             .ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         lock (_cacheLock)
         {
             if (string.Equals(_cacheKey, key, StringComparison.Ordinal)
-                && _cachedTranslations.TryAdd(text, (result, _clock.GetTimestamp()))
+                && _cachedTranslations.TryAdd(cacheEntry, (result, _clock.GetTimestamp()))
                 && _cachedTranslations.Count > MaxCachedTranslations)
             {
-                string oldest = _cachedTranslations.MinBy(entry => entry.Value.WrittenAt).Key;
+                var oldest = _cachedTranslations.MinBy(entry => entry.Value.WrittenAt).Key;
                 _cachedTranslations.Remove(oldest);
             }
         }
@@ -191,11 +218,16 @@ public sealed partial class DeepSeekClient
     }
 
     // 给收发、解析和重试共用一个时限，剩余时间不足时保留第一次失败的原因。
-    private async Task<LookupResult> _requestTranslationAsync(string text, bool isWord, string key,
-        CancellationToken cancellationToken)
+    private async Task<LookupResult> _requestTranslationAsync(string text, bool isWord, TranslationDirection direction,
+        string key, CancellationToken cancellationToken)
     {
-        string task = isWord
+        string task = direction == TranslationDirection.ToEnglish
             ? """
+              将中文或中英混合内容译为自然、地道、准确的英文。保留原有分段、换行，以及需要保留的代码标识符和专有名词。
+              单个中文词或短语直接给出最常用、自然的英文表达，不附加解释。
+              只输出 JSON，例如 {"english":"clear cache"}。
+              """
+            : isWord ? """
               查一个英文词。分别检查计算机常用义和日常交流高频义，留意动词、名词、形容词等不同词性。
               用简体中文各填一个代表义：technical 填计算机义，everyday 填日常义。某类没有常用义就填 null。
               两类都没有时将最常见的义项填入 fallback，其余情况 fallback 为 null。
@@ -234,7 +266,7 @@ public sealed partial class DeepSeekClient
                 request.Content = JsonContent.Create(body);
                 try
                 {
-                    return await _sendAsync(request, text, isWord, token).ConfigureAwait(false);
+                    return await _sendAsync(request, text, isWord, direction, token).ConfigureAwait(false);
                 }
                 catch (LookupException ex) when (attempt == 0 && ex.RetryDelay is { } delay
                     && RequestBudget - Stopwatch.GetElapsedTime(started) >= delay + MinimumRetryTime)
@@ -251,7 +283,7 @@ public sealed partial class DeepSeekClient
 
     // 先检查 HTTP 状态，再读取译文。区分临时故障和重复请求也难以解决的错误。
     private async Task<LookupResult> _sendAsync(HttpRequestMessage request, string text, bool isWord,
-        CancellationToken token)
+        TranslationDirection direction, CancellationToken token)
     {
         try
         {
@@ -298,12 +330,17 @@ public sealed partial class DeepSeekClient
                 };
             }
             var word = isWord ? JsonSerializer.Deserialize<WordTranslation>(content, Json) : null;
-            string? chinese = isWord
-                ? _formatWordMeanings(text, word)
-                : JsonSerializer.Deserialize<Translation>(content, Json)?.Chinese?.Trim();
-            if (string.IsNullOrWhiteSpace(chinese))
+            string? translation = direction switch
             {
-                throw new LookupException("DeepSeek 返回的词义为空，请稍后重试。")
+                TranslationDirection.ToEnglish => _readEnglishTranslation(content),
+                _ when isWord => _formatWordMeanings(text, word),
+                _ => JsonSerializer.Deserialize<Translation>(content, Json)?.Chinese?.Trim(),
+            };
+            if (string.IsNullOrWhiteSpace(translation))
+            {
+                throw new LookupException(direction == TranslationDirection.ToEnglish
+                    ? "DeepSeek 未返回有效的英文译文，请稍后重试。"
+                    : "DeepSeek 返回的词义为空，请稍后重试。")
                 {
                     RetryDelay = DefaultRetryDelay,
                 };
@@ -315,7 +352,7 @@ public sealed partial class DeepSeekClient
                 ipa = null;
             }
 
-            return new(text, chinese, ipa) { IsWord = isWord };
+            return new(text, translation, ipa) { IsWord = isWord, Direction = direction };
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
@@ -347,6 +384,12 @@ public sealed partial class DeepSeekClient
             };
         }
     }
+
+    // 沿用 Web JSON 的字段大小写规则，只接受字符串译文。
+    private static string? _readEnglishTranslation(string content) =>
+        JsonSerializer.Deserialize<EnglishTranslation>(content, Json)?.English is { ValueKind: JsonValueKind.String } english
+            ? english.GetString()?.Trim()
+            : null;
 
     // 仅对常见临时 HTTP 故障重试，并遵守服务端给出的等待时间。
     private static TimeSpan? _retryAfter(HttpResponseMessage response)
@@ -449,5 +492,6 @@ public sealed partial class DeepSeekClient
         ApiMessage? Message, [property: JsonPropertyName("finish_reason")] string? FinishReason);
     private sealed record ApiMessage(string? Content);
     private sealed record Translation(string? Chinese);
+    private sealed record EnglishTranslation(JsonElement English);
     private sealed record WordTranslation(JsonElement Technical, JsonElement Everyday, JsonElement Fallback, JsonElement Ipa);
 }

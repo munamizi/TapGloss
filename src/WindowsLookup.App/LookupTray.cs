@@ -11,8 +11,10 @@ namespace WindowsLookup.App;
 /// <summary>管理托盘、选区确认、DeepSeek 查询和本地朗读。</summary>
 internal sealed class LookupTray : IDisposable
 {
-    private const string ShortcutLabel = "Alt+T";
-    private WindowsHotkey? _hotkey;
+    private const string ChineseShortcut = "Alt+T";
+    private const string EnglishShortcut = "Alt+R";
+    private readonly WindowsHotkey? _chineseHotkey;
+    private readonly WindowsHotkey? _englishHotkey;
     private readonly WindowsTray _icon;
     private LookupWindow? _window;
     private readonly SelectionReader _selection = new(Environment.ProcessPath);
@@ -29,8 +31,8 @@ internal sealed class LookupTray : IDisposable
     private Task _lookupTask = Task.CompletedTask;
     private Task<SelectionCapture> _captureTask = Task.FromResult(new SelectionCapture(CaptureStatus.Unavailable));
     private CancellationTokenSource? _currentLookup;
-    private (string Text, string Key, CancellationTokenSource Lifetime, Task<LookupResult> Task)? _pendingTranslation;
-    private (nint Window, nint Focus, uint Sequence, long StartedAt)? _manualCopy;
+    private (string Text, string Key, TranslationDirection Direction, CancellationTokenSource Lifetime, Task<LookupResult> Task)? _pendingTranslation;
+    private (nint Window, nint Focus, TranslationDirection Direction, uint Sequence, long StartedAt)? _manualCopy;
     private bool _editingKey;
     private bool _exiting;
     private bool _disposed;
@@ -38,7 +40,7 @@ internal sealed class LookupTray : IDisposable
     private LookupResult? _visibleResult;
 
     /// <summary>
-    /// 创建托盘入口，读取本地配置并尝试注册快捷键。
+    /// 创建托盘入口，读取本地配置并分别尝试注册两个翻译快捷键。
     ///
     /// Args:
     ///     无。
@@ -47,16 +49,9 @@ internal sealed class LookupTray : IDisposable
     /// </summary>
     internal LookupTray()
     {
-        string? shortcutError = null;
-        try
-        {
-            _hotkey = new WindowsHotkey(HotkeyModifiers.Alt, Forms.Keys.T);
-            _hotkey.Pressed += _queueLookup;
-        }
-        catch (Win32Exception ex)
-        {
-            shortcutError = _describeShortcutError(ex);
-        }
+        var shortcutErrors = new List<string>(2);
+        _chineseHotkey = _tryRegisterHotkey(Forms.Keys.T, TranslationDirection.ToChinese, shortcutErrors);
+        _englishHotkey = _tryRegisterHotkey(Forms.Keys.R, TranslationDirection.ToEnglish, shortcutErrors);
         try
         {
             _apiKey = _keys.Load();
@@ -68,20 +63,53 @@ internal sealed class LookupTray : IDisposable
 
         _speechMode = _speechModeStore._load();
         _speech.SetMemoryMode(_speechMode);
+        string shortcutStatus = (_chineseHotkey is not null, _englishHotkey is not null) switch
+        {
+            (true, true) => $"{ChineseShortcut} / {EnglishShortcut}",
+            (true, false) => $"{ChineseShortcut} · {EnglishShortcut} 未启用",
+            (false, true) => $"{EnglishShortcut} · {ChineseShortcut} 未启用",
+            _ => $"{ChineseShortcut} / {EnglishShortcut} 未启用",
+        };
         _icon = new WindowsTray(
-            _hotkey is null ? "TapGloss · 快捷键未启用" : $"TapGloss · {ShortcutLabel}",
+            $"TapGloss · {shortcutStatus}",
             () => _ = _runMenuActionAsync(_editKeyAsync),
             () => _speechMode,
             _selectSpeechMode,
             () => _ = _runMenuActionAsync(_exitAsync));
-        if (shortcutError is not null)
+        if (shortcutErrors.Count > 0)
         {
-            _icon._notify("快捷键未启用", shortcutError, warning: true);
+            _icon._notify("快捷键未启用", string.Join(Environment.NewLine, shortcutErrors), warning: true);
         }
 
-        // 启动后即在后台完成一次静默合成，托盘可立即使用。
-        _ = _speech.PrepareAsync();
+        // 英译中入口启用时，在后台静默预热 Amy。
+        if (_chineseHotkey is not null)
+        {
+            _ = _speech.PrepareAsync();
+        }
     }
+
+    // 一次只注册一个方向，冲突只影响该快捷键。
+    private WindowsHotkey? _tryRegisterHotkey(Forms.Keys key, TranslationDirection direction, List<string> errors)
+    {
+        try
+        {
+            var hotkey = new WindowsHotkey(HotkeyModifiers.Alt, key);
+            hotkey.Pressed += source => _queueLookup(source, direction);
+            return hotkey;
+        }
+        catch (Win32Exception ex)
+        {
+            string shortcut = _shortcutLabel(direction);
+            errors.Add(ex.NativeErrorCode == 1409
+                ? $"{shortcut} 已被其他程序占用。释放该组合后，重启 TapGloss。"
+                : $"Windows 无法注册 {shortcut}（错误 {ex.NativeErrorCode}）。");
+            return null;
+        }
+    }
+
+    // 取得本次翻译方向对应的快捷键名称。
+    private static string _shortcutLabel(TranslationDirection direction) =>
+        direction == TranslationDirection.ToEnglish ? EnglishShortcut : ChineseShortcut;
 
     // 在热键来源的桌面重用浮窗，换桌面或桌面归属不明确时创建新窗口。
     private LookupWindow _lookupWindowFor(Guid desktopId, nint sourceWindow)
@@ -110,9 +138,10 @@ internal sealed class LookupTray : IDisposable
     }
 
     // 新请求先取消上一次，本次取词单独读取前台来源。
-    private void _queueLookup(nint sourceWindow)
+    private void _queueLookup(nint sourceWindow, TranslationDirection direction)
     {
-        if (_exiting || _editingKey || _hotkey is null
+        nint clipboardWindow = (_chineseHotkey ?? _englishHotkey)?.Handle ?? 0;
+        if (_exiting || _disposed || _editingKey || clipboardWindow == 0
             || _icon.IsMenuOpen || sourceWindow == _window?.Handle)
         {
             return;
@@ -125,13 +154,14 @@ internal sealed class LookupTray : IDisposable
         nint sourceFocus = WindowsHotkey.GetFocusedWindow(sourceWindow);
         Guid desktopId = VirtualDesktop._getDesktopId(sourceWindow);
         _lookupTask = _runLookupAsync(request, sourceWindow, sourceFocus,
-            _hotkey.Handle, Forms.Cursor.Position, desktopId);
+            clipboardWindow, Forms.Cursor.Position, desktopId, direction);
     }
 
     // 从本次来源取词，异步查询模型并更新浮窗。
     private async Task _runLookupAsync(CancellationTokenSource request, nint sourceWindow, nint sourceFocus,
-        nint clipboardWindow, Point anchor, Guid desktopId)
+        nint clipboardWindow, Point anchor, Guid desktopId, TranslationDirection direction)
     {
+        string shortcut = _shortcutLabel(direction);
         CancellationToken token = request.Token;
         LookupWindow? window = null;
         Rectangle? selectionBounds = null;
@@ -150,17 +180,17 @@ internal sealed class LookupTray : IDisposable
             var manualCopy = _manualCopy;
             _manualCopy = null;
             uint previousManualSequence = manualCopy is { } pending && pending.Window == sourceWindow && pending.Focus == sourceFocus
-                && Environment.TickCount64 - pending.StartedAt < 60_000 ? pending.Sequence : 0;
+                && pending.Direction == direction && Environment.TickCount64 - pending.StartedAt < 60_000 ? pending.Sequence : 0;
             _captureTask = _captureLookupAsync(_captureTask, sourceWindow, clipboardWindow, token, previousManualSequence,
-                sourceFocus);
+                sourceFocus, shortcut);
             SelectionCapture capture = await _captureTask;
             token.ThrowIfCancellationRequested();
             selectionBounds = capture.SelectionBounds;
             if (capture.Status == CaptureStatus.NeedsManualCopy)
             {
                 _cancelTranslation();
-                _manualCopy = (sourceWindow, sourceFocus, capture.ClipboardSequence, Environment.TickCount64);
-                string instructions = $"在原窗口按 Ctrl+C，再按 {ShortcutLabel}。取得文字后直接翻译。";
+                _manualCopy = (sourceWindow, sourceFocus, direction, capture.ClipboardSequence, Environment.TickCount64);
+                string instructions = $"在原窗口按 Ctrl+C，再按 {shortcut}。取得文字后直接翻译。";
                 if (!string.IsNullOrWhiteSpace(capture.Detail))
                 {
                     instructions = capture.Detail + Environment.NewLine + instructions;
@@ -172,25 +202,26 @@ internal sealed class LookupTray : IDisposable
             if (capture.Status is not (CaptureStatus.Selected or CaptureStatus.Copied))
             {
                 _cancelTranslation();
-                window._display(anchor, "未取得文字", capture.Detail ?? $"请先选中英文，再按 {ShortcutLabel}。");
+                string selectionHint = direction == TranslationDirection.ToEnglish ? "请先选中文字" : "请先选中英文";
+                window._display(anchor, "未取得文字", capture.Detail ?? $"{selectionHint}，再按 {shortcut}。");
                 return;
             }
 
             token.ThrowIfCancellationRequested();
-            Task<LookupResult> translation = _translate(capture, key);
+            Task<LookupResult> translation = _translate(capture, key, direction);
             if (!translation.IsCompleted)
             {
                 window._display(anchor, "正在查词", capture.Text ?? "", selectionBounds: selectionBounds);
 
                 // 预计会自动朗读单词时，在等待译文的时间里先加载本地音色。
-                if (DeepSeekClient.IsWordCandidate(capture.Text))
+                if (direction == TranslationDirection.ToChinese && DeepSeekClient.IsWordCandidate(capture.Text))
                 {
                     _ = _speech.PrepareAsync();
                 }
             }
             LookupResult result = await translation.WaitAsync(token);
             token.ThrowIfCancellationRequested();
-            _showResult(window, anchor, result, selectionBounds);
+            _showResult(window, anchor, result, selectionBounds, clipboardWindow);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -203,7 +234,7 @@ internal sealed class LookupTray : IDisposable
                 _cancelTranslation();
                 try
                 {
-                    string message = ex is LookupException ? ex.Message : "本次查询未完成，请再按 Alt+T 重试。";
+                    string message = ex is LookupException ? ex.Message : $"本次查询未完成，请再按 {shortcut} 重试。";
                     window._display(anchor, "查词失败", message, selectionBounds: selectionBounds);
                 }
                 catch (Exception displayError)
@@ -224,7 +255,8 @@ internal sealed class LookupTray : IDisposable
 
     // 只让取词串行，旧请求失败或取消后让下一次查询继续。
     private async Task<SelectionCapture> _captureLookupAsync(Task<SelectionCapture> previous,
-        nint sourceWindow, nint clipboardWindow, CancellationToken token, uint previousManualSequence, nint sourceFocus)
+        nint sourceWindow, nint clipboardWindow, CancellationToken token, uint previousManualSequence, nint sourceFocus,
+        string shortcut)
     {
         try
         {
@@ -235,14 +267,14 @@ internal sealed class LookupTray : IDisposable
             Trace.TraceWarning("上一笔取词未完成（{0}）。", ex.GetType().Name);
         }
         token.ThrowIfCancellationRequested();
-        return await _selection.CaptureAsync(sourceWindow, clipboardWindow, token, previousManualSequence, sourceFocus);
+        return await _selection.CaptureAsync(sourceWindow, clipboardWindow, token, previousManualSequence, sourceFocus, shortcut);
     }
 
-    // 相同的已核验原文复用进行中的请求，其他原文发起请求前取消旧的网络等待。
-    private Task<LookupResult> _translate(SelectionCapture capture, string key)
+    // 原文、方向和密钥都相同时复用进行中的请求。
+    private Task<LookupResult> _translate(SelectionCapture capture, string key, TranslationDirection direction)
     {
         string text = capture.Text?.Trim() ?? "";
-        if (_pendingTranslation is { } pending && pending.Text == text && pending.Key == key
+        if (_pendingTranslation is { } pending && pending.Text == text && pending.Key == key && pending.Direction == direction
             && !pending.Task.IsFaulted && !pending.Task.IsCanceled)
         {
             return pending.Task;
@@ -250,8 +282,8 @@ internal sealed class LookupTray : IDisposable
         _cancelTranslation();
 
         var lifetime = new CancellationTokenSource();
-        Task<LookupResult> task = _translations.TranslateAsync(capture, key, lifetime.Token);
-        _pendingTranslation = (text, key, lifetime, task);
+        Task<LookupResult> task = _translations.TranslateAsync(capture, key, lifetime.Token, direction);
+        _pendingTranslation = (text, key, direction, lifetime, task);
         _ = _releaseTranslationAsync(task, lifetime);
         return task;
     }
@@ -290,13 +322,20 @@ internal sealed class LookupTray : IDisposable
         }
     }
 
-    // 单词显示词义和可用音标后自动朗读一次，短语和句子只展示译文。
-    private void _showResult(LookupWindow window, Point anchor, LookupResult result, Rectangle? selectionBounds)
+    // 英文译文可复制，英译中单词显示词义和可用音标并自动朗读。
+    private void _showResult(LookupWindow window, Point anchor, LookupResult result, Rectangle? selectionBounds,
+        nint clipboardWindow)
     {
         _visibleResult = result;
+        if (result.Direction == TranslationDirection.ToEnglish)
+        {
+            window._display(anchor, "译文", result.Text, selectionBounds: selectionBounds,
+                copy: token => ClipboardFallback.CopyTextAsync(clipboardWindow, result.Text, token));
+            return;
+        }
         if (!result.IsWord)
         {
-            window._display(anchor, "译文", result.Chinese, selectionBounds: selectionBounds);
+            window._display(anchor, "译文", result.Text, selectionBounds: selectionBounds);
             return;
         }
         string body = result.AmericanIpa is { } ipa ? result.Chinese + Environment.NewLine + ipa : result.Chinese;
@@ -391,7 +430,7 @@ internal sealed class LookupTray : IDisposable
         }
         _speechMode = mode;
         _speech.SetMemoryMode(mode);
-        if (mode == SpeechMemoryMode.Resident)
+        if (mode == SpeechMemoryMode.Resident && _chineseHotkey is not null)
         {
             _ = _speech.PrepareAsync();
         }
@@ -457,28 +496,15 @@ internal sealed class LookupTray : IDisposable
         }
         _apiKey = key;
         _keyLoadError = null;
-        string message = _hotkey is null
-            ? "API Key 已保存。请释放 Alt+T 后重启 TapGloss。"
-            : $"API Key 已保存。选中文字后按 {ShortcutLabel}。";
+        string message = (_chineseHotkey is not null, _englishHotkey is not null) switch
+        {
+            (true, true) => $"API Key 已保存。选中文字后按 {ChineseShortcut} 或 {EnglishShortcut}。",
+            (true, false) => $"API Key 已保存。选中文字后按 {ChineseShortcut}。",
+            (false, true) => $"API Key 已保存。选中文字后按 {EnglishShortcut}。",
+            _ => "API Key 已保存。请释放快捷键后重启 TapGloss。",
+        };
         _icon._notify("TapGloss", message);
         return null;
-    }
-
-    // 根据 Windows 的注册错误给出固定热键的冲突提示。
-    private static string _describeShortcutError(Win32Exception error) =>
-        error.NativeErrorCode == 1409
-            ? "Alt+T 已被其他程序占用。释放该组合后，重启 TapGloss。"
-            : $"Windows 无法注册 Alt+T（错误 {error.NativeErrorCode}）。";
-
-    // 释放当前组合的注册和消息窗口。
-    private void _releaseHotkey()
-    {
-        if (_hotkey is not null)
-        {
-            _hotkey.Pressed -= _queueLookup;
-            _hotkey.Dispose();
-            _hotkey = null;
-        }
     }
 
     // 等待进行中的取词释放剪贴板，再结束消息循环。
@@ -544,7 +570,8 @@ internal sealed class LookupTray : IDisposable
             return;
         }
         _disposed = true;
-        _releaseHotkey();
+        _chineseHotkey?.Dispose();
+        _englishHotkey?.Dispose();
         _icon.Dispose();
         _speech.Dispose();
         _selection.Dispose();

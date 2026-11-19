@@ -106,11 +106,16 @@ internal sealed class OutsideClickWatcher : IDisposable
         });
     }
 
-    // 应用消息循环退出后停止共用的鼠标消息线程。
+    // 应用消息循环退出后等待专用队列处理完钩子注销并关闭线程。
     internal static void _shutdownHookThread()
     {
-        _hookThread?.ShutdownQueue();
+        DispatcherQueueController? controller = _hookThread;
         _hookThread = null;
+        if (controller is not null)
+        {
+            // 等待 WinRT 的异步关闭，完成回调无需回到已结束的界面消息循环。
+            Task.Run(async () => await controller.ShutdownQueueAsync()).GetAwaiter().GetResult();
+        }
     }
 
     /// <summary>

@@ -17,7 +17,9 @@ internal sealed partial class LookupWindow
     private const int MaxCardWidth = 380;
     private const int MinCardHeight = 88;
     private const int MaxCardHeight = 320;
-    private const double HorizontalPadding = 32;
+    private const double CardSidePadding = 16;
+    private const double HorizontalPadding = 2 * CardSidePadding;
+    private const double CopyColumnSpacing = 12;
 
     private readonly Grid _root = new();
     private readonly Grid _titleDragArea = new()
@@ -32,6 +34,7 @@ internal sealed partial class LookupWindow
     private readonly TextBlock _phonetic = new() { IsTextSelectionEnabled = true, MaxWidth = 264 };
     private readonly Border _wordDivider = new();
     private readonly StackPanel _statusHeader = new() { Spacing = 0, Visibility = Visibility.Collapsed };
+    private readonly Grid _statusTop = new();
     private readonly StackPanel _statusLine = new()
     {
         Orientation = Orientation.Horizontal,
@@ -62,6 +65,7 @@ internal sealed partial class LookupWindow
         _applyOptionalStyle(_statusDivider, "LookupDividerStyle");
         _applyOptionalStyle(_notice, "LookupNoticeTextStyle");
         _applyOptionalStyle(_speak, "LookupCompactButtonStyle");
+        _applyOptionalStyle(_copy, "LookupCompactIconButtonStyle");
 
         _phoneticBadge.Margin = new Thickness(0, 0, 8, 0);
         _wordDivider.Margin = new Thickness(0, 9, 0, 0);
@@ -70,6 +74,9 @@ internal sealed partial class LookupWindow
         _speak.Content = _buildSpeakContent();
         AutomationProperties.SetName(_speak, "美式发音");
         ToolTipService.SetToolTip(_speak, "重听美式发音");
+        _copy.Content = _copyIcon;
+        AutomationProperties.SetName(_copy, CopyLabel);
+        ToolTipService.SetToolTip(_copy, CopyLabel);
 
         // 单词结果头：首词直接置于左上角，紧邻音标胶囊与同排发音操作。
         _phoneticBadge.Child = _phonetic;
@@ -89,7 +96,12 @@ internal sealed partial class LookupWindow
         _statusLine.Children.Add(_loadingRing);
         _statusLine.Children.Add(_statusIcon);
         _statusLine.Children.Add(_statusTitle);
-        _statusHeader.Children.Add(_statusLine);
+        _statusTop.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        _statusTop.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _statusTop.Children.Add(_statusLine);
+        _statusTop.Children.Add(_copy);
+        Grid.SetColumn(_copy, 1);
+        _statusHeader.Children.Add(_statusTop);
         _statusHeader.Children.Add(_statusDivider);
 
         _headerHost.Children.Add(_wordHeader);
@@ -103,7 +115,7 @@ internal sealed partial class LookupWindow
 
         var contentHost = new Grid
         {
-            Padding = new Thickness(16, 12, 16, 14),
+            Padding = new Thickness(CardSidePadding, 12, CardSidePadding, 14),
         };
         contentHost.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         contentHost.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -134,6 +146,7 @@ internal sealed partial class LookupWindow
             }
         };
         _titleDragArea.SizeChanged += (_, _) => _syncDragRegion();
+        _copy.SizeChanged += (_, _) => _syncDragRegion();
         _root.Loaded += (_, _) => _fitAfterFirstLoad();
         return _root;
     }
@@ -158,7 +171,7 @@ internal sealed partial class LookupWindow
         return panel;
     }
 
-    // 保留顶部留白拖动，单词区域依旧可以选字。
+    // 保留顶部留白拖动，左右分别避开单词和复制按钮。
     private void _updateDragRegion(bool isWordMode)
     {
         double leftOffset = 0;
@@ -167,11 +180,27 @@ internal sealed partial class LookupWindow
             _heading.Measure(new Windows.Foundation.Size(MaxCardWidth - HorizontalPadding, double.PositiveInfinity));
             leftOffset = Math.Min(MaxCardWidth, Math.Ceiling(_heading.DesiredSize.Width) + 20);
         }
-        if (_titleDragArea.Margin.Left != leftOffset)
+        bool copyVisible = _copy.Visibility == Visibility.Visible;
+        double rightOffset = 0;
+        if (copyVisible)
+        {
+            _copy.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+            rightOffset = Math.Max(_copy.ActualWidth, _copy.DesiredSize.Width) + CardSidePadding + 4;
+        }
+        bool marginChanged = _titleDragArea.Margin.Left != leftOffset || _titleDragArea.Margin.Right != rightOffset;
+        if (marginChanged || copyVisible)
         {
             _root.LayoutUpdated -= _syncDragRegionAfterLayout;
             _root.LayoutUpdated += _syncDragRegionAfterLayout;
-            _titleDragArea.Margin = new Thickness(leftOffset, 0, 0, 0);
+        }
+        if (marginChanged)
+        {
+            _titleDragArea.Margin = new Thickness(leftOffset, 0, rightOffset, 0);
+        }
+        if (copyVisible && _copy.ActualWidth > 0)
+        {
+            // 复用同宽浮窗时可能没有新一轮布局，立即恢复已清除的复制按钮命中区。
+            _syncDragRegion();
         }
     }
 
@@ -191,20 +220,35 @@ internal sealed partial class LookupWindow
         }
 
         _nonClientPointer ??= InputNonClientPointerSource.GetForWindowId(AppWindow.Id);
-        if (_titleDragArea.ActualWidth <= 0 || _titleDragArea.ActualHeight <= 0)
+        double scale = xamlRoot.RasterizationScale;
+        if (_titleDragArea.ActualWidth > 0 && _titleDragArea.ActualHeight > 0)
+        {
+            var origin = _titleDragArea.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point());
+            _nonClientPointer.SetRegionRects(NonClientRegionKind.Caption,
+            [
+                new RectInt32(
+                    (int)Math.Round(origin.X * scale), (int)Math.Round(origin.Y * scale),
+                    (int)Math.Round(_titleDragArea.ActualWidth * scale), (int)Math.Round(_titleDragArea.ActualHeight * scale)),
+            ]);
+        }
+        else
         {
             _nonClientPointer.ClearRegionRects(NonClientRegionKind.Caption);
-            return;
         }
 
-        var origin = _titleDragArea.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point());
-        double scale = xamlRoot.RasterizationScale;
-        _nonClientPointer.SetRegionRects(NonClientRegionKind.Caption,
-        [
-            new RectInt32(
-                (int)Math.Round(origin.X * scale), (int)Math.Round(origin.Y * scale),
-                (int)Math.Round(_titleDragArea.ActualWidth * scale), (int)Math.Round(_titleDragArea.ActualHeight * scale)),
-        ]);
+        if (_copy.Visibility == Visibility.Visible && _copy.ActualWidth > 0 && _copy.ActualHeight > 0)
+        {
+            var origin = _copy.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point());
+            int left = (int)Math.Floor(origin.X * scale);
+            int top = (int)Math.Floor(origin.Y * scale);
+            int right = (int)Math.Ceiling((origin.X + _copy.ActualWidth) * scale);
+            int bottom = (int)Math.Ceiling((origin.Y + _copy.ActualHeight) * scale);
+            _nonClientPointer.SetRegionRects(NonClientRegionKind.Passthrough, [new RectInt32(left, top, right - left, bottom - top)]);
+        }
+        else
+        {
+            _nonClientPointer.ClearRegionRects(NonClientRegionKind.Passthrough);
+        }
     }
 
     // 按资源键安全读取应用样式，缺失时不抛异常。

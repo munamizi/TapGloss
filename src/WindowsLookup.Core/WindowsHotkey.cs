@@ -18,6 +18,7 @@ public sealed class WindowsHotkey : NativeWindow, IDisposable
     private const int HotkeyId = 1;
     private const int HotkeyMessage = 0x0312;
     private const uint NoRepeat = 0x4000;
+    private const int AltKey = 0x12;
 
     /// <summary>
     /// 在调用线程的消息循环上注册全局快捷键。
@@ -65,17 +66,29 @@ public sealed class WindowsHotkey : NativeWindow, IDisposable
     /// Args:
     ///     message - Windows 传给该消息窗口的消息
     /// Returns:
-    ///     无返回值，收到注册热键时触发 Pressed。
+    ///     无返回值，收到注册热键时先抑制单按 Alt 的菜单行为，再触发 Pressed。
     /// </summary>
     protected override void WndProc(ref Message message)
     {
         if (message.Msg == HotkeyMessage && message.WParam == HotkeyId)
         {
-            Pressed?.Invoke(_getForegroundWindow());
+            nint sourceWindow = _getForegroundWindow();
+            var modifiers = (HotkeyModifiers)(message.LParam.ToInt64() & 0xffff);
+            if (sourceWindow != 0 && _tryGetFocusState(sourceWindow, out _, out bool inMenu)
+                && _getForegroundWindow() == sourceWindow
+                && _shouldMaskAlt(modifiers, ClipboardFallback._isPressed(AltKey), inMenu))
+            {
+                ClipboardFallback._maskAltMenu();
+            }
+            Pressed?.Invoke(sourceWindow);
             return;
         }
         base.WndProc(ref message);
     }
+
+    // Alt 仍按下且菜单未激活时才有机会阻止菜单行为。
+    internal static bool _shouldMaskAlt(HotkeyModifiers modifiers, bool altPressed, bool inMenu = false) =>
+        (modifiers & HotkeyModifiers.Alt) != 0 && altPressed && !inMenu;
 
     [DllImport("user32.dll", EntryPoint = "GetForegroundWindow")]
     internal static extern nint _getForegroundWindow();
@@ -91,12 +104,22 @@ public sealed class WindowsHotkey : NativeWindow, IDisposable
     /// Returns:
     ///     焦点控件句柄 - 欠缺窗口或无法取得焦点时为 0。
     /// </summary>
-    public static nint GetFocusedWindow(nint sourceWindow)
+    public static nint GetFocusedWindow(nint sourceWindow) =>
+        _tryGetFocusState(sourceWindow, out nint focus, out _) ? focus : 0;
+
+    // 从同一份 GUI 线程状态取得原生焦点及普通、系统或弹出菜单模式。
+    internal static bool _tryGetFocusState(nint sourceWindow, out nint focus, out bool inMenu)
     {
         uint thread = _getWindowThreadProcessId(sourceWindow, out _);
         var info = new GuiThreadInfo { Size = Marshal.SizeOf<GuiThreadInfo>() };
-        return thread != 0 && _getGuiThreadInfo(thread, ref info) ? info.Focus : 0;
+        bool obtained = thread != 0 && _getGuiThreadInfo(thread, ref info);
+        focus = obtained ? info.Focus : 0;
+        inMenu = obtained && _isInMenuMode(info.Flags);
+        return obtained;
     }
+
+    // 对应 GUI_INMENUMODE、GUI_SYSTEMMENUMODE 和 GUI_POPUPMENUMODE。
+    internal static bool _isInMenuMode(int flags) => (flags & 0x1c) != 0;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct GuiThreadInfo

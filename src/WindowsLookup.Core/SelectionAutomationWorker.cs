@@ -78,6 +78,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
             {
                 SelectionBounds = reply.Bounds,
                 FallbackMode = reply.FallbackMode,
+                AutomationFocusChecked = reply.AutomationFocusChecked,
             };
         }
         catch (OperationCanceledException)
@@ -191,7 +192,8 @@ internal sealed class SelectionAutomationWorker : IDisposable
                 ? SelectionReader._readSelection((nint)handle)
                 : new(CaptureStatus.Unavailable, Detail: "来源窗口已切换。");
             Console.WriteLine(JsonSerializer.Serialize(
-                new SelectionReply(capture.Status, capture.Text, capture.Detail, capture.SelectionBounds, capture.FallbackMode)));
+                new SelectionReply(capture.Status, capture.Text, capture.Detail, capture.SelectionBounds,
+                    capture.FallbackMode, capture.AutomationFocusChecked)));
         }
     }
 
@@ -214,5 +216,5 @@ internal sealed class SelectionAutomationWorker : IDisposable
     }
 
     private sealed record SelectionReply(CaptureStatus Status, string? Text, string? Detail, Rectangle? Bounds,
-        ClipboardFallbackMode FallbackMode);
+        ClipboardFallbackMode FallbackMode, bool AutomationFocusChecked);
 }
