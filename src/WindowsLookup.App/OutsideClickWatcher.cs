@@ -15,7 +15,7 @@ internal sealed class OutsideClickWatcher
     private const int MiddleButtonDown = 0x0207;
     private const int ExtraButtonDown = 0x020B;
     private const uint Root = 2;
-    private const uint RootOwner = 3;
+    private const uint Owner = 4;
 
     private readonly DispatcherQueue _dispatcher;
     private readonly nint _window;
@@ -91,10 +91,15 @@ internal sealed class OutsideClickWatcher
         {
             return;
         }
-        nint target = _windowFromPoint(point);
-        if (target != _window && _getAncestor(target, RootOwner) != _window)
+        nint target = _getAncestor(_windowFromPoint(point), Root);
+        nint owner = target;
+        while (owner != 0 && owner != _window)
         {
-            _outside(_getAncestor(target, Root));
+            owner = _getWindow(owner, Owner);
+        }
+        if (owner == 0)
+        {
+            _outside(target);
         }
     }
 
@@ -117,4 +122,7 @@ internal sealed class OutsideClickWatcher
 
     [DllImport("user32.dll", EntryPoint = "GetAncestor")]
     private static extern nint _getAncestor(nint window, uint kind);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindow")]
+    private static extern nint _getWindow(nint window, uint relation);
 }

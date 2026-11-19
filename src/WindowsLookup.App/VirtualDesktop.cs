@@ -5,7 +5,18 @@ namespace WindowsLookup.App;
 /// <summary>通过 Windows Shell 查询窗口的虚拟桌面归属。</summary>
 internal static class VirtualDesktop
 {
+    private const int DwmCloaked = 14;
     private static IVirtualDesktopManager? _manager;
+
+    private const uint CloakedByShell = 2;
+
+    // 判断窗口是否已被 Windows 切出合成画面。
+    internal static bool _isShellCloaked(nint window) =>
+        _getDwmWindowAttribute(window, DwmCloaked, out uint flags, sizeof(uint)) >= 0
+        && (flags & CloakedByShell) != 0;
+
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    private static extern int _getDwmWindowAttribute(nint window, int attribute, out uint value, int valueSize);
 
     // 优先由来源窗口判断桌面是否可见，来源关闭或移动后通过当前前台窗口核对桌面。
     internal static bool _isCurrent(Guid desktopId, nint sourceWindow)
@@ -16,7 +27,7 @@ internal static class VirtualDesktop
             && sourceDesktop == desktopId
             && manager._isWindowOnCurrentVirtualDesktop(sourceWindow, out bool sourceIsCurrent) >= 0)
         {
-            return sourceIsCurrent;
+            return sourceIsCurrent && !_isShellCloaked(sourceWindow);
         }
 
         return _getDesktopId(_foregroundWindow()) == desktopId;
@@ -73,6 +84,5 @@ internal static class VirtualDesktop
         // 第二个 COM 方法返回指定顶层窗口所属的桌面标识。
         [PreserveSig]
         int _getWindowDesktopId(nint window, out Guid desktopId);
-
     }
 }

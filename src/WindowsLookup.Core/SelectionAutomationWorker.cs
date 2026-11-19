@@ -66,7 +66,9 @@ internal sealed class SelectionAutomationWorker : IDisposable
         {
             lock (_sync) { _stopProcess(); }
             token.ThrowIfCancellationRequested();
-            return new(CaptureStatus.Unavailable, Detail: "来源应用的选区接口响应超时，请再按 Alt+T 重试。");
+            // 界面仍在原窗口时，由取词入口继续尝试安全的剪贴板路径。
+            Trace.TraceWarning("选区接口响应超时，已停止读取子进程。");
+            return new(CaptureStatus.Unavailable);
         }
         catch (Exception ex) when (ex is IOException or Win32Exception or InvalidOperationException or JsonException)
         {

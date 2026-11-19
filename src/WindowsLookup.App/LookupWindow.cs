@@ -14,11 +14,23 @@ namespace WindowsLookup.App;
 internal sealed partial class LookupWindow : Window
 {
     private const int ExtendedStyle = -20;
+    private const int OwnerIndex = -8;
+    private const uint OwnerRelation = 4;
     private const int ToolWindowStyle = 0x80;
     private const int AppWindowStyle = 0x40000;
     private const int DisableDwmTransitions = 3;
+    private const int DwmCornerPreference = 33;
+    private const int DwmRoundCorners = 2;
+    private const uint ForegroundChanged = 0x0003;
+    private const uint WindowCloaked = 0x8017;
+    private const uint WindowUncloaked = 0x8018;
+    private readonly nint _desktopOwner;
     private readonly OutsideClickWatcher _outsideClicks;
     private readonly DispatcherQueueTimer? _desktopWatcher;
+    private readonly WinEventCallback _desktopEvent;
+    private nint _foregroundHook;
+    private nint _cloakHook;
+    private bool _desktopManagedByShell;
     private readonly TextBlock _heading = new() { IsTextSelectionEnabled = true };
     private readonly TextBlock _body = new() { IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap };
     private readonly Button _speak = new();
@@ -33,7 +45,7 @@ internal sealed partial class LookupWindow : Window
     private bool _closing;
 
     /// <summary>
-    /// 创建无任务栏按钮的浮窗，并跟踪它应该显示的虚拟桌面。
+    /// 通过隐藏宿主创建无任务栏按钮的浮窗，由 Windows 管理桌面切换。
     ///
     /// Args:
     ///     desktopId - 触发查词时来源窗口所属的虚拟桌面。
@@ -45,16 +57,22 @@ internal sealed partial class LookupWindow : Window
     {
         DesktopId = desktopId;
         Title = "TapGloss";
+        _desktopOwner = _createDesktopOwner(Handle);
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.IsAlwaysOnTop = true;
         presenter.IsMaximizable = false;
         presenter.IsMinimizable = false;
+        presenter.IsResizable = false;
         presenter.SetBorderAndTitleBar(hasBorder: true, hasTitleBar: false);
-        _excludeFromTaskbar();
-        _disableWindowTransitions();
+        _configureWindowFrame();
+        if (_desktopOwner == 0)
+        {
+            _excludeFromTaskbar();
+        }
         _outsideClicks = new OutsideClickWatcher(DispatcherQueue, Handle,
             target => _dismissFromUi(keepManualCopy: target != 0 && target == SourceWindow));
         SourceWindow = sourceWindow;
+        _desktopEvent = _onDesktopEvent;
         if (desktopId != Guid.Empty)
         {
             _desktopWatcher = DispatcherQueue.CreateTimer();
@@ -77,7 +95,7 @@ internal sealed partial class LookupWindow : Window
 
     internal event Action<bool>? Dismissed;
     internal nint Handle => WinRT.Interop.WindowNative.GetWindowHandle(this);
-    internal bool IsVisible => AppWindow.IsVisible;
+    internal bool IsVisible => AppWindow.IsVisible && !VirtualDesktop._isShellCloaked(Handle);
     internal Guid DesktopId { get; }
     internal nint SourceWindow { get; set; }
 
@@ -105,13 +123,41 @@ internal sealed partial class LookupWindow : Window
         _updateDragRegion(speak is not null);
         _placeWithFittedSize(anchor);
         _updateDesktopVisibility();
-        if (_desktopWatcher is { IsRunning: false })
-        {
-            _desktopWatcher.Start();
-        }
     }
 
-    // 在窗口首次显示前排除任务栏和任务切换入口。
+    // 创建始终隐藏的同线程宿主，让已显示的浮窗参加虚拟桌面切换。
+    private static nint _createDesktopOwner(nint popup)
+    {
+        // 隐藏的普通顶层窗口可以屏蔽任务栏按钮，同时保留浮窗的桌面归属。
+        nint owner = _createWindow(0, "STATIC", null, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        if (owner != 0)
+        {
+            _setWindowOwner(popup, OwnerIndex, owner);
+            if (_getWindowOwner(popup, OwnerRelation) == owner)
+            {
+                return owner;
+            }
+            _destroyWindow(owner);
+        }
+
+        Trace.TraceWarning("译文窗口无法创建虚拟桌面宿主。");
+        return 0;
+    }
+
+    [DllImport("user32.dll", EntryPoint = "CreateWindowExW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern nint _createWindow(uint extendedStyle, string className, string? title, uint style,
+        int x, int y, int width, int height, nint parent, nint menu, nint instance, nint parameter);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern nint _setWindowOwner(nint window, int index, nint owner);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindow")]
+    private static extern nint _getWindowOwner(nint window, uint relation);
+
+    [DllImport("user32.dll", EntryPoint = "DestroyWindow")]
+    private static extern bool _destroyWindow(nint window);
+
+    // 隐藏宿主不可用时，用窗口样式保留仅托盘的使用方式。
     private void _excludeFromTaskbar()
     {
         try
@@ -127,24 +173,104 @@ internal sealed partial class LookupWindow : Window
         }
     }
 
-    // 排除任务切换的窗口不再由 Shell 随虚拟桌面切换，显示状态由来源桌面决定。
-    private void _updateDesktopVisibility()
+    // 在等待首次显示或系统尚未接管时监听桌面变化，定时器补查遗漏的通知。
+    private void _startDesktopTracking()
     {
-        bool onLookupDesktop = DesktopId == Guid.Empty || VirtualDesktop._isCurrent(DesktopId, SourceWindow);
-        if (onLookupDesktop && !IsVisible)
+        if (_desktopWatcher is not { IsRunning: false })
         {
-            AppWindow.Show(activateWindow: false);
-            _outsideClicks._start();
+            return;
         }
-        else if (!onLookupDesktop && IsVisible)
+
+        _foregroundHook = _setWinEventHook(ForegroundChanged, ForegroundChanged, 0, _desktopEvent, 0, 0, 0);
+        _cloakHook = _setWinEventHook(WindowCloaked, WindowUncloaked, 0, _desktopEvent, 0, 0, 0);
+        _desktopWatcher.Start();
+    }
+
+    // 关闭查询时停止消息监听，并忽略已排队的旧通知。
+    private void _stopDesktopTracking()
+    {
+        _desktopWatcher?.Stop();
+        if (_foregroundHook != 0)
         {
-            _hidePopup();
+            _unhookWinEvent(_foregroundHook);
+            _foregroundHook = 0;
+        }
+        if (_cloakHook != 0)
+        {
+            _unhookWinEvent(_cloakHook);
+            _cloakHook = 0;
         }
     }
 
-    // 只禁用译文浮窗的系统显隐过渡，切换桌面时隐藏操作即时生效。
-    private void _disableWindowTransitions()
+    // 遮蔽通知在窗口线程交付，收到后立即核对来源桌面。
+    private void _onDesktopEvent(nint hook, uint kind, nint window, int objectId, int childId, uint thread, uint time)
     {
+        if (objectId == 0 && childId == 0
+            && (hook == _foregroundHook && kind == ForegroundChanged
+                || hook == _cloakHook && window == SourceWindow))
+        {
+            _updateDesktopVisibility();
+        }
+    }
+
+    // 首次只在查询来源桌面显示，确认归属后由 Windows 随桌面一起合成浮窗。
+    private void _updateDesktopVisibility()
+    {
+        if (_desktopManagedByShell || _checkShellDesktop())
+        {
+            return;
+        }
+
+        bool canShow = DesktopId == Guid.Empty || VirtualDesktop._isCurrent(DesktopId, SourceWindow);
+        if (canShow && !AppWindow.IsVisible)
+        {
+            AppWindow.Show(activateWindow: false);
+            _outsideClicks._start();
+            if (_checkShellDesktop())
+            {
+                return;
+            }
+        }
+        else if (!canShow && AppWindow.IsVisible)
+        {
+            // 系统未接管时，切走即收起本次查词，避免返回时再补弹。
+            _dismiss(keepManualCopy: false);
+            return;
+        }
+
+        _startDesktopTracking();
+    }
+
+    // 只有系统确认浮窗归属于原桌面后，才撤下本应用的桌面监听。
+    private bool _checkShellDesktop()
+    {
+        if (!AppWindow.IsVisible || (DesktopId != Guid.Empty
+            && (_desktopOwner == 0 || VirtualDesktop._getDesktopId(Handle) != DesktopId)))
+        {
+            return false;
+        }
+
+        _desktopManagedByShell = true;
+        _stopDesktopTracking();
+        return true;
+    }
+
+    private delegate void WinEventCallback(nint hook, uint kind, nint window, int objectId, int childId,
+        uint thread, uint time);
+
+    [DllImport("user32.dll", EntryPoint = "SetWinEventHook")]
+    private static extern nint _setWinEventHook(uint min, uint max, nint module, WinEventCallback callback,
+        uint process, uint thread, uint flags);
+
+    [DllImport("user32.dll", EntryPoint = "UnhookWinEvent")]
+    private static extern bool _unhookWinEvent(nint hook);
+
+    // 使用 Windows 原生圆角和边框，并保持浮窗独立显隐时的快速响应。
+    private void _configureWindowFrame()
+    {
+        int corners = DwmRoundCorners;
+        _setDwmWindowAttribute(Handle, DwmCornerPreference, ref corners, sizeof(int));
+
         int disabled = 1;
         int result = _setDwmWindowAttribute(Handle, DisableDwmTransitions, ref disabled, sizeof(int));
         if (result < 0)
@@ -162,23 +288,18 @@ internal sealed partial class LookupWindow : Window
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
     private static extern int _setWindowStyle(nint window, int index, int style);
 
-    // 隐藏浮窗并释放本次结果的按钮回调。
+    // 收起浮窗并清理本次交互，包括已被系统遮蔽的浮窗。
     internal void _hide()
     {
-        _desktopWatcher?.Stop();
-        _loadingRing.IsActive = false;
-        _hidePopup();
-        _speakAction = null;
-    }
-
-    // 暂时隐藏或主动收起时都结束点外监听。
-    private void _hidePopup()
-    {
+        _stopDesktopTracking();
         _outsideClicks._stop();
-        if (IsVisible)
+        _loadingRing.IsActive = false;
+        if (_desktopManagedByShell || AppWindow.IsVisible)
         {
             AppWindow.Hide();
         }
+        _desktopManagedByShell = false;
+        _speakAction = null;
     }
 
     // 在操作区旁显示语音错误，并按需重新适配窗口尺寸以保证提示完整可见。
@@ -193,13 +314,17 @@ internal sealed partial class LookupWindow : Window
         }
     }
 
-    // 退出应用时关闭窗口，避免进入复用浮窗的隐藏逻辑。
+    // 先关 WinUI 浮窗，再销毁同线程的隐藏宿主。
     internal void _close()
     {
-        _desktopWatcher?.Stop();
+        _stopDesktopTracking();
         _outsideClicks._stop();
         _closing = true;
         Close();
+        if (_desktopOwner != 0)
+        {
+            _destroyWindow(_desktopOwner);
+        }
     }
 
     // 配置单词结果的层次：主词条、紧邻音标与同排朗读按钮、下方词义正文。
@@ -368,13 +493,18 @@ internal sealed partial class LookupWindow : Window
         }
     }
 
-    // 点外或按 Esc 收起浮窗，保留回到来源窗口完成手动复制的机会。
+    // 只在浮窗所在桌面处理点外关闭，其他桌面的点击不影响本次结果。
     private void _dismissFromUi(bool keepManualCopy = false)
     {
-        if (!IsVisible)
+        if (IsVisible)
         {
-            return;
+            _dismiss(keepManualCopy);
         }
+    }
+
+    // 收起本次查词，通知托盘清理请求及朗读状态。
+    private void _dismiss(bool keepManualCopy)
+    {
         _hide();
         Dismissed?.Invoke(keepManualCopy);
     }

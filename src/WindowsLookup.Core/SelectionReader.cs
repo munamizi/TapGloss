@@ -71,6 +71,16 @@ public sealed class SelectionReader : IDisposable
     public void Dispose() => _worker?.Dispose();
 
     /// <summary>
+    /// 等待已开始的剪贴板操作收尾，供关闭消息窗口前调用。
+    ///
+    /// Args:
+    ///     无。
+    /// Returns:
+    ///     无返回值，后台操作关闭剪贴板后任务完成。
+    /// </summary>
+    public Task FinishClipboardAsync() => ClipboardFallback._waitForIdleAsync();
+
+    /// <summary>
     /// 读取前台选区，必要时尝试一次临时复制。
     ///
     /// 步骤：
@@ -80,7 +90,7 @@ public sealed class SelectionReader : IDisposable
     /// Args:
     ///     sourceWindow - 热键触发时记录的前台窗口句柄
     ///     clipboardWindow - 调用方持有的消息窗口句柄，用于恢复剪贴板
-    ///     cancellationToken - 取消等待，已经开始的复制会先结束并处理剪贴板
+    ///     cancellationToken - 取消本次等待，已开始的临时复制在后台处理完剪贴板
     ///     previousManualSequence - 提示手动复制时的剪贴板序列号，0 表示没有待处理的手动复制
     ///     sourceFocus - 热键触发时的焦点控件句柄，0 表示进入读取时再获取。
     /// Returns:
@@ -114,18 +124,12 @@ public sealed class SelectionReader : IDisposable
                 return capture;
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
-            if (previousManualSequence != 0)
-            {
-                SelectionCapture copied = await Task.Run(
-                    () => ClipboardFallback._readManualCopy(sourceWindow, clipboardWindow, previousManualSequence, sourceFocus),
-                    cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-                return copied;
-            }
-
-            SelectionCapture fallback = await ClipboardFallback._captureAsync(
-                sourceWindow, clipboardWindow, cancellationToken, sourceFocus).ConfigureAwait(false);
+            SelectionCapture fallback = await ClipboardFallback._withClipboardBudgetAsync(
+                token => previousManualSequence != 0
+                    ? Task.FromResult(ClipboardFallback._readManualCopy(
+                        sourceWindow, clipboardWindow, previousManualSequence, sourceFocus))
+                    : ClipboardFallback._captureAsync(sourceWindow, clipboardWindow, token, sourceFocus),
+                cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             return fallback;
         }

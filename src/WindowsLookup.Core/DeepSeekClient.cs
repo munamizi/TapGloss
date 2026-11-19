@@ -37,6 +37,14 @@ public sealed class LookupException : Exception
 public sealed partial class DeepSeekClient
 {
     private const int MaxCachedTranslations = 128;
+    private static readonly TimeSpan WordCacheLifetime = TimeSpan.FromMinutes(10);
+    private static readonly char[] WordEndPunctuation = ['.', ',', ':', ';', '!', '?', '。', '，', '：', '；', '！', '？', '、', '…'];
+    private static readonly Dictionary<string, string> KnownWordMeanings = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["compact"] = "压缩（文件）；紧凑的",
+        ["socket"] = "套接字；插座",
+        ["thread"] = "线程；线",
+    };
     private static readonly Uri Endpoint = new("https://api.deepseek.com/chat/completions");
     private static readonly TimeSpan RequestBudget = TimeSpan.FromSeconds(12);
     private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromMilliseconds(400);
@@ -54,9 +62,9 @@ public sealed partial class DeepSeekClient
     };
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     private readonly HttpClient _http;
+    private readonly TimeProvider _clock;
     private readonly object _cacheLock = new();
-    private readonly Dictionary<string, LookupResult> _cachedTranslations = new(StringComparer.Ordinal);
-    private readonly Queue<string> _cacheOrder = new();
+    private readonly Dictionary<string, (LookupResult Result, long WrittenAt)> _cachedTranslations = new(StringComparer.Ordinal);
     private string? _cacheKey;
 
     /// <summary>
@@ -70,22 +78,27 @@ public sealed partial class DeepSeekClient
     public DeepSeekClient() : this(SharedHttp) { }
 
     /// <summary>
-    /// 在隔离验证中使用指定的 HTTP 传输。
+    /// 在隔离验证中使用指定的 HTTP 传输和缓存时钟。
     ///
     /// Args:
-    ///     http - 由验证程序管理生命周期的 HTTP 客户端
+    ///     http - 由调用方管理生命周期的 HTTP 客户端
+    ///     clock - 缓存计时来源，省略时使用系统单调时钟
     /// Returns:
-    ///     DeepSeekClient - 使用指定传输的翻译客户端
+    ///     DeepSeekClient - 使用指定传输和时钟的翻译客户端
     /// </summary>
-    internal DeepSeekClient(HttpClient http) => _http = http;
+    internal DeepSeekClient(HttpClient http, TimeProvider? clock = null)
+    {
+        _http = http;
+        _clock = clock ?? TimeProvider.System;
+    }
 
     /// <summary>
     /// 查找本次取到的英文的简体中文译文，单词可带美式音标。
     ///
     /// 步骤：
-    ///     1. 校验选区和密钥，尝试复用同一密钥下的译文。
+    ///     1. 校验选区和密钥，整理单词选区并尝试复用未过期的译文。
     ///     2. 在 12 秒总预算内调用 DeepSeek，遇到可恢复的故障时最多重试一次。
-    ///     3. 返回已校验的结果，并在内存中保留最新写入的 128 条译文。
+    ///     3. 返回按规则整理的译文，并在内存中最多保留 128 条结果。单词缓存 10 分钟。
     /// Args:
     ///     selection - 直接取得的选区，或本次从原应用复制到的新文字
     ///     apiKey - 当前用户的 DeepSeek API Key
@@ -116,18 +129,23 @@ public sealed partial class DeepSeekClient
             throw new LookupException("DeepSeek API Key 格式有误，请重新复制完整密钥。");
         }
 
-        bool isWord = text.Length <= 80 && _wordPattern().IsMatch(text);
+        string? word = _getWord(text);
+        bool isWord = word is not null;
+        text = word ?? text;
         lock (_cacheLock)
         {
             if (!string.Equals(_cacheKey, key, StringComparison.Ordinal))
             {
                 _cachedTranslations.Clear();
-                _cacheOrder.Clear();
                 _cacheKey = key;
             }
-            if (_cachedTranslations.TryGetValue(text, out LookupResult? cached))
+            if (_cachedTranslations.TryGetValue(text, out var cached))
             {
-                return cached;
+                if (!isWord || _clock.GetElapsedTime(cached.WrittenAt) < WordCacheLifetime)
+                {
+                    return cached.Result;
+                }
+                _cachedTranslations.Remove(text);
             }
         }
 
@@ -136,13 +154,12 @@ public sealed partial class DeepSeekClient
         cancellationToken.ThrowIfCancellationRequested();
         lock (_cacheLock)
         {
-            if (string.Equals(_cacheKey, key, StringComparison.Ordinal) && _cachedTranslations.TryAdd(text, result))
+            if (string.Equals(_cacheKey, key, StringComparison.Ordinal)
+                && _cachedTranslations.TryAdd(text, (result, _clock.GetTimestamp()))
+                && _cachedTranslations.Count > MaxCachedTranslations)
             {
-                _cacheOrder.Enqueue(text);
-                if (_cacheOrder.Count > MaxCachedTranslations)
-                {
-                    _cachedTranslations.Remove(_cacheOrder.Dequeue());
-                }
+                string oldest = _cachedTranslations.MinBy(entry => entry.Value.WrittenAt).Key;
+                _cachedTranslations.Remove(oldest);
             }
         }
         return result;
@@ -154,8 +171,12 @@ public sealed partial class DeepSeekClient
     {
         string task = isWord
             ? """
-              计算机常用义、日常交流高频义各至多一项。仅命中一类只给一义，两类皆无取最常用义。技术义在前，用「；」分隔。
-              简体词义和首义美式音标（/ /）用 JSON。cache 无日常高频义→{"chinese":"缓存","ipa":"/kæʃ/"}。cookie→「网络凭证；饼干」。
+              查一个英文词。分别检查计算机常用义和日常交流高频义，留意动词、名词、形容词等不同词性。
+              用简体中文各填一个代表义：technical 填计算机义，everyday 填日常义。某类没有常用义就填 null。
+              两类都没有时将最常见的义项填入 fallback，其余情况 fallback 为 null。
+              ipa 填首义的美式音标（计算机义优先，用 / / 包围），不确定时填 null。
+              只输出 JSON。compact → {"technical":"压缩（文件）","everyday":"紧凑的","fallback":null,"ipa":"/kəmˈpækt/"}。
+              cache → {"technical":"缓存","everyday":null,"fallback":null,"ipa":"/kæʃ/"}。
               """
             : """
               将短语或句子译为自然的简体中文，保留原有分段和需要保留的代码标识。
@@ -251,8 +272,10 @@ public sealed partial class DeepSeekClient
                     RetryDelay = DefaultRetryDelay,
                 };
             }
-            var result = JsonSerializer.Deserialize<Translation>(content, Json);
-            string? chinese = result?.Chinese?.Trim();
+            var word = isWord ? JsonSerializer.Deserialize<WordTranslation>(content, Json) : null;
+            string? chinese = isWord
+                ? _formatWordMeanings(text, word)
+                : JsonSerializer.Deserialize<Translation>(content, Json)?.Chinese?.Trim();
             if (string.IsNullOrWhiteSpace(chinese))
             {
                 throw new LookupException("DeepSeek 返回的词义为空，请稍后重试。")
@@ -260,7 +283,7 @@ public sealed partial class DeepSeekClient
                     RetryDelay = DefaultRetryDelay,
                 };
             }
-            string? ipa = isWord && result?.Ipa is { ValueKind: JsonValueKind.String } value
+            string? ipa = word?.Ipa is { ValueKind: JsonValueKind.String } value
                 ? value.GetString()?.Trim() : null;
             if (ipa is not { Length: >= 3 } || ipa[0] != '/' || ipa[^1] != '/')
             {
@@ -330,12 +353,55 @@ public sealed partial class DeepSeekClient
         _ => $"DeepSeek 拒绝了本次请求（{(int)status}）。",
     };
 
-    [GeneratedRegex("^[A-Za-z]+(?:[-'’][A-Za-z]+)*$")]
+    // 去掉单词外层的引号和句末标点，保留词内符号和短语原文。
+    private static string? _getWord(string text)
+    {
+        string word = text.TrimEnd(WordEndPunctuation).TrimEnd();
+        if (word.Length > 1 && (word[0], word[^1]) is
+            ('"', '"') or ('\'', '\'') or ('“', '”') or ('‘', '’') or ('「', '」') or ('『', '』') or ('\u0060', '\u0060'))
+        {
+            word = word[1..^1].Trim().TrimEnd(WordEndPunctuation).TrimEnd();
+        }
+        return word.Length <= 80 && _wordPattern().IsMatch(word)
+            ? word.Replace('‐', '-').Replace('‑', '-')
+            : null;
+    }
+
+    // 已核实的术语使用本地释义，其余词按计算机义、日常义的顺序拼接。
+    private static string? _formatWordMeanings(string text, WordTranslation? reply)
+    {
+        if (reply is null)
+        {
+            return null;
+        }
+        if (KnownWordMeanings.TryGetValue(text, out string? known))
+        {
+            return known;
+        }
+
+        string? technical = _firstSense(reply.Technical);
+        string? everyday = _firstSense(reply.Everyday);
+        if (technical is null)
+        {
+            return everyday ?? _firstSense(reply.Fallback);
+        }
+        return everyday is null || technical == everyday ? technical : technical + "；" + everyday;
+    }
+
+    // 一个类别最多展示一个义项，兼容模型偶尔返回的分行或分号列表。
+    private static string? _firstSense(string? field)
+    {
+        string? sense = field?.Split(['；', ';', '\r', '\n'], 2, StringSplitOptions.TrimEntries)[0];
+        return string.IsNullOrWhiteSpace(sense) ? null : sense;
+    }
+
+    [GeneratedRegex(@"^(?:[A-Za-z]+(?:['’‐‑-][A-Za-z]+)*|[Cc](?:\+\+|#)|\.[Nn][Ee][Tt])$")]
     private static partial Regex _wordPattern();
 
     private sealed record Completion(Choice[]? Choices);
     private sealed record Choice(
         ApiMessage? Message, [property: JsonPropertyName("finish_reason")] string? FinishReason);
     private sealed record ApiMessage(string? Content);
-    private sealed record Translation(string? Chinese, JsonElement Ipa);
+    private sealed record Translation(string? Chinese);
+    private sealed record WordTranslation(string? Technical, string? Everyday, string? Fallback, JsonElement Ipa);
 }

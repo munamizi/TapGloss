@@ -2,7 +2,7 @@
   <img src="src/WindowsLookup.App/Assets/WindowsLookup.png" alt="TopGloss 图标" width="96" height="96">
 </p>
 
-<h1 align="center">TopGloss（轻触释义）</h1>
+<h1 align="center">TapGloss（轻触释义）</h1>
 
 <p align="center">轻量的 Windows 托盘翻译工具，采用 WinUI，现代原生。选中英文，按 <kbd>Alt</kbd> + <kbd>T</kbd>，就能在浮窗中显示对应简中译文。</p>
 

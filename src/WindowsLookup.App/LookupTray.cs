@@ -109,7 +109,7 @@ internal sealed class LookupTray : IDisposable
         return window;
     }
 
-    // 新请求先取消上一次，并等待可能还在进行的剪贴板恢复。
+    // 新请求先取消上一次，本次取词单独读取前台来源。
     private void _queueLookup(nint sourceWindow)
     {
         if (_exiting || _editingKey || _hotkey is null
@@ -489,6 +489,7 @@ internal sealed class LookupTray : IDisposable
         }
         finally
         {
+            await _selection.FinishClipboardAsync();
             Dispose();
             Application.Current.Exit();
         }

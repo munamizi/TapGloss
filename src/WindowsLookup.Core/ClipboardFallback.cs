@@ -12,11 +12,68 @@ internal static class ClipboardFallback
     private const int MaxClipboardBytes = 128 * 1024 * 1024;
     private const string OleObject = "DataObject";
     private const string OleMetadata = "Ole Private Data";
+    private const uint RootWindow = 2;
     private const uint InputKeyboard = 1;
     private const uint KeyUp = 2;
     private const ushort Control = 0x11;
     private const ushort CopyKey = 0x43;
     private static readonly int[] TriggerKeys = [0x10, 0x11, 0x12, 0x5B, 0x5C, CopyKey];
+    private static readonly TimeSpan ClipboardBudget = TimeSpan.FromMilliseconds(1800);
+    private static readonly SemaphoreSlim ClipboardGate = new(1);
+
+    // 为查词限时，已开始的复制仍由后台收尾，其间不允许另一笔操作改动剪贴板。
+    internal static async Task<SelectionCapture> _withClipboardBudgetAsync(
+        Func<CancellationToken, Task<SelectionCapture>> action, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!ClipboardGate.Wait(0))
+        {
+            return new(CaptureStatus.Unavailable, Detail: "上一笔剪贴板操作尚未结束，请稍后重试。");
+        }
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(ClipboardBudget);
+        CancellationToken token = deadline.Token;
+        Task<SelectionCapture> attempt = Task.Run(async () =>
+        {
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                return await action(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return new SelectionCapture(CaptureStatus.Unavailable);
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceWarning("剪贴板取词结束（{0}）。", ex.GetType().Name);
+                return new SelectionCapture(CaptureStatus.Unavailable, Detail: "剪贴板读取失败，请重试。");
+            }
+            finally
+            {
+                ClipboardGate.Release();
+            }
+        });
+
+        try
+        {
+            SelectionCapture result = await attempt.WaitAsync(token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            return result;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return new(CaptureStatus.Unavailable, Detail: "剪贴板处理超时，请稍后再按 Alt+T。");
+        }
+    }
+
+    // 退出进程前等待后台操作关闭剪贴板并释放临时备份。
+    internal static async Task _waitForIdleAsync()
+    {
+        await ClipboardGate.WaitAsync().ConfigureAwait(false);
+        ClipboardGate.Release();
+    }
 
     // 先保存原始格式，再复制。发送后完成读取和恢复才响应取消。
     internal static async Task<SelectionCapture> _captureAsync(nint sourceWindow, nint clipboardWindow,
@@ -48,7 +105,7 @@ internal static class ClipboardFallback
         string? snapshotError;
         try
         {
-            previousData = _snapshot(out snapshotError);
+            previousData = _snapshot(out snapshotError, cancellationToken);
             previousSequence = _sequence();
         }
         finally
@@ -77,6 +134,7 @@ internal static class ClipboardFallback
             {
                 return new(CaptureStatus.Unavailable, Detail: "来源窗口已关闭。");
             }
+            cancellationToken.ThrowIfCancellationRequested();
             Input[] keys = [_key(Control, 0), _key(CopyKey, 0), _key(CopyKey, KeyUp), _key(Control, KeyUp)];
             uint sent = _sendInput((uint)keys.Length, keys, Marshal.SizeOf<Input>());
             if (sent is 1 or 2 or 3)
@@ -175,22 +233,38 @@ internal static class ClipboardFallback
     private static SelectionCapture _readAndRestore(uint observedSequence, List<(uint Format, nint Handle)> previousData,
         nint sourceWindow, nint sourceFocus, uint sourceProcess)
     {
-        WindowsHotkey._getWindowThreadProcessId(_clipboardOwner(), out uint clipboardProcess);
+        nint clipboardOwner = _clipboardOwner();
+        WindowsHotkey._getWindowThreadProcessId(clipboardOwner, out uint clipboardProcess);
         if (_sequence() != observedSequence || clipboardProcess != sourceProcess)
         {
             return new(CaptureStatus.Unavailable, Detail: "剪贴板由其他应用更新，请重试。");
         }
 
-        if (!SelectionReader._isCurrentSource(sourceWindow, sourceFocus))
+        bool sourceIsCurrent = SelectionReader._isCurrentSource(sourceWindow, sourceFocus);
+        if (!sourceIsCurrent && !_canRestoreAfterFocusChange(clipboardOwner, sourceWindow, sourceFocus))
         {
-            return new(CaptureStatus.Unavailable, Detail: "读取时输入焦点已切换。");
+            return new(CaptureStatus.Unavailable, Detail: "输入焦点已切换，当前剪贴板的来源不明确。");
         }
-        SelectionCapture captured = _readUnicodeText(sourceProcess);
-        if (!_restore(previousData))
+
+        SelectionCapture captured = new(CaptureStatus.Unavailable);
+        bool restored;
+        try
+        {
+            if (sourceIsCurrent)
+            {
+                captured = _readUnicodeText(sourceProcess);
+            }
+        }
+        finally
+        {
+            restored = _restore(previousData);
+        }
+
+        if (!restored)
         {
             return new(CaptureStatus.Unavailable, Detail: "Windows 未能完整恢复剪贴板。");
         }
-        if (!SelectionReader._isCurrentSource(sourceWindow, sourceFocus))
+        if (!sourceIsCurrent || !SelectionReader._isCurrentSource(sourceWindow, sourceFocus))
         {
             return new(CaptureStatus.Unavailable, Detail: "读取时来源窗口已切换。");
         }
@@ -199,8 +273,14 @@ internal static class ClipboardFallback
             : captured;
     }
 
+    // 焦点切走后，同一进程可能有其他窗口，只有原控件或已退出前台的原窗口可以恢复。
+    private static bool _canRestoreAfterFocusChange(nint clipboardOwner, nint sourceWindow, nint sourceFocus) =>
+        (sourceFocus != 0 && clipboardOwner == sourceFocus)
+        || (WindowsHotkey._getForegroundWindow() != sourceWindow
+            && (clipboardOwner == sourceWindow || _getAncestor(clipboardOwner, RootWindow) == sourceWindow));
+
     // 复制每种可还原的格式，只有所有数据都已独立备份才允许模拟复制。
-    private static List<(uint Format, nint Handle)>? _snapshot(out string? failure)
+    private static List<(uint Format, nint Handle)>? _snapshot(out string? failure, CancellationToken token)
     {
         var snapshot = new List<(uint Format, nint Handle)>();
         failure = "未能备份原剪贴板。";
@@ -216,6 +296,7 @@ internal static class ClipboardFallback
             uint format = 0;
             while (true)
             {
+                token.ThrowIfCancellationRequested();
                 Marshal.SetLastPInvokeError(0);
                 format = _nextFormat(format);
                 if (format == 0)
@@ -242,7 +323,9 @@ internal static class ClipboardFallback
 
             foreach (var (dataFormat, label, oleObject, oleMetadata) in formats)
             {
+                token.ThrowIfCancellationRequested();
                 nint handle = _getClipboardData(dataFormat);
+                token.ThrowIfCancellationRequested();
                 if (oleObject)
                 {
                     if (!_isFlushedOleObject(handle))
@@ -541,6 +624,9 @@ internal static class ClipboardFallback
 
     [DllImport("user32.dll", EntryPoint = "GetClipboardOwner")]
     private static extern nint _clipboardOwner();
+
+    [DllImport("user32.dll", EntryPoint = "GetAncestor")]
+    private static extern nint _getAncestor(nint window, uint relation);
 
     [DllImport("user32.dll", EntryPoint = "GetClipboardSequenceNumber")]
     private static extern uint _sequence();
