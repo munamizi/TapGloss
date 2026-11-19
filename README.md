@@ -1,23 +1,34 @@
-# TapGloss
+<p align="center">
+  <img src="src/WindowsLookup.App/Assets/WindowsLookup.png" alt="TopGloss 图标" width="96" height="96">
+</p>
 
-基于 .NET 10 和 WinUI 3 的 Windows 托盘翻译工具。选中英文后按 **Alt+T**，鼠标附近会显示 DeepSeek 译文。单词支持美式音标和本地 Amy 朗读。
+<h1 align="center">TopGloss（轻触释义）</h1>
 
-## 使用
+<p align="center">轻量的 Windows 托盘翻译工具。选中英文，按 <kbd>Alt</kbd> + <kbd>T</kbd>，就能看到英文简中译文。</p>
 
-完整解压应用运行包，在装有 x64 版 .NET 10 Desktop Runtime 和对应 Windows App Runtime 的 Windows 上运行 `TapGloss.exe`。右键托盘图标，打开「设置 API Key」保存自己的 DeepSeek API Key。密钥通过 Windows DPAPI 加密保存在当前用户的本地配置中。
+# 使用说明
 
-托盘菜单中的「模式切换」可选择 Amy 动态续热或静态常驻。动态续热在闲置 15 分钟后释放模型，静态常驻会保留模型直到应用退出。
+## 安装
 
-## 构建
+1. 在 x64 Windows 上安装 [.NET 10 Desktop Runtime（x64）](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) 和 [Windows App Runtime 2.6.5（x64）](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads#stable-release)。
+2. 完整解压运行包，双击其中的 `TapGloss.exe`。
+3. 右键系统托盘中的应用图标，打开 **设置 API Key**，填入自己的 DeepSeek API Key。
 
-在 Windows 上安装 .NET 10 SDK，从本目录打开 PowerShell。
+## 日常使用
 
-```powershell
-dotnet build .\src\WindowsLookup.App\WindowsLookup.App.csproj -c Release
-```
+在浏览器或编辑器里选中英文，按 **Alt+T**。译文会在选区或光标附近弹出，点击浮窗外即可收起。
 
-发布可运行版本时，给 `PiperVoiceBundle` 指定完整的离线语音目录。其中应包含 Amy 的 ONNX 模型及配置、`python` 和 `packages`。可使用现有 TapGloss 运行包中的 `voice` 目录。
+<p align="center">
+  <img src="docs/lookup-demo.png" alt="在浏览器中选中 TapGloss 后，浮窗显示美式音标、发音按钮和中文释义" width="860">
+</p>
 
-```powershell
-dotnet publish .\src\WindowsLookup.App\WindowsLookup.App.csproj -c Release --self-contained false "-p:PiperVoiceBundle=C:\path\to\voice"
-```
+查单词时，浮窗会显示可用的美式音标，并用本地 Amy 女声自动朗读一次。点击 **美式** 可以重听。翻译通过 DeepSeek 联网完成，朗读在本机离线完成。
+
+## 模式切换
+
+右键系统托盘图标，选择 **模式切换**。两种模式都会在程序启动时静默预热 Amy，区别在于闲置后是否释放语音模型。
+
+| 模式 | 行为 |
+| --- | --- |
+| **动态续热（默认）** | 每次朗读后重新计时。闲置 15 分钟后释放模型，下次朗读时重新加载。 |
+| **静态常驻** | 模型一直留在内存里，直到退出程序。适合频繁查词、希望随时快速发音的场景。 |
