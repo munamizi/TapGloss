@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/WindowsLookup.App/Assets/WindowsLookup.png" alt="TopGloss 图标" width="96" height="96">
+  <img src="src/WindowsLookup.App/Assets/WindowsLookup.png" alt="TapGloss 图标" width="96" height="96">
 </p>
 
 <h1 align="center">TapGloss（轻触释义）</h1>
@@ -45,7 +45,7 @@
 
 ## 架构说明
 
-TopGloss 用 C# 和 .NET 10 编写，托盘菜单和译文浮窗使用 WinUI 3。按下 **Alt+T** 后，程序按以下流程处理。
+TapGloss 用 C# 和 .NET 10 编写，托盘菜单和译文浮窗使用 WinUI 3。按下 **Alt+T** 后，程序按以下流程处理。
 
 1. **读取选区**。用 Windows UI Automation 读取当前应用选中的文字。遇到不支持直接读取的应用，会尝试通过临时复制取得选区。
 2. **翻译并显示**。将取得的文字交给 DeepSeek，收到简体中文译文后，在选区或光标附近显示浮窗。

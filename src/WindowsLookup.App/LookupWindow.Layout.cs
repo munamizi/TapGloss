@@ -167,7 +167,19 @@ internal sealed partial class LookupWindow
             _heading.Measure(new Windows.Foundation.Size(MaxCardWidth - HorizontalPadding, double.PositiveInfinity));
             leftOffset = Math.Min(MaxCardWidth, Math.Ceiling(_heading.DesiredSize.Width) + 20);
         }
-        _titleDragArea.Margin = new Thickness(leftOffset, 0, 0, 0);
+        if (_titleDragArea.Margin.Left != leftOffset)
+        {
+            _root.LayoutUpdated -= _syncDragRegionAfterLayout;
+            _root.LayoutUpdated += _syncDragRegionAfterLayout;
+            _titleDragArea.Margin = new Thickness(leftOffset, 0, 0, 0);
+        }
+    }
+
+    // 只同步一次新布局中的位置，覆盖拖动区移动但宽度未变的情况。
+    private void _syncDragRegionAfterLayout(object? sender, object args)
+    {
+        _root.LayoutUpdated -= _syncDragRegionAfterLayout;
+        _syncDragRegion();
     }
 
     // 将无标题栏卡片的拖动区映射为 Windows 的物理像素命中区域。

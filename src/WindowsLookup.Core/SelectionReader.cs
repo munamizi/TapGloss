@@ -16,11 +16,20 @@ public enum CaptureStatus
     NeedsManualCopy,
 }
 
+internal enum ClipboardFallbackMode
+{
+    None,
+    Automatic,
+}
+
 /// <summary>成功读取选区或新复制文本时携带文字，其余状态可携带本地提示。</summary>
 public sealed record SelectionCapture(CaptureStatus Status, string? Text = null, string? Detail = null)
 {
     [System.Text.Json.Serialization.JsonIgnore]
     public uint ClipboardSequence { get; internal init; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    internal ClipboardFallbackMode FallbackMode { get; init; }
 
     [System.Text.Json.Serialization.JsonIgnore]
     public System.Drawing.Rectangle? SelectionBounds { get; internal init; }
@@ -105,6 +114,10 @@ public sealed class SelectionReader : IDisposable
             return new(CaptureStatus.Unavailable, Detail: "来源窗口已切换。");
         }
         sourceFocus = sourceFocus == 0 ? WindowsHotkey.GetFocusedWindow(sourceWindow) : sourceFocus;
+        if (_isNativePassword(sourceFocus))
+        {
+            return new(CaptureStatus.Protected, Detail: "此控件包含受保护文本。");
+        }
         if (!_captureGate.Wait(0))
         {
             return new(CaptureStatus.Unavailable, Detail: "正在读取上一处选区。");
@@ -119,7 +132,7 @@ public sealed class SelectionReader : IDisposable
             {
                 return new(CaptureStatus.Unavailable, Detail: "读取时来源窗口已切换。");
             }
-            if (capture.Status != CaptureStatus.Unavailable || capture.Detail is not null)
+            if (capture.Status != CaptureStatus.Unavailable || capture.FallbackMode == ClipboardFallbackMode.None)
             {
                 return capture;
             }
@@ -144,12 +157,35 @@ public sealed class SelectionReader : IDisposable
         sourceWindow != 0 && sourceWindow == WindowsHotkey._getForegroundWindow()
         && (sourceFocus == 0 || WindowsHotkey.GetFocusedWindow(sourceWindow) == sourceFocus);
 
+    // UIA 不可用时仍拦截带密码样式的原生编辑框和富文本框。
+    internal static bool _isNativePassword(nint focus)
+    {
+        const int style = -16;
+        const int password = 0x20;
+        if (focus == 0 || (_getWindowStyle(focus, style) & password) == 0)
+        {
+            return false;
+        }
+
+        var className = new StringBuilder(64);
+        _getClassName(focus, className, className.Capacity);
+        string name = className.ToString();
+        return name.Equals("Edit", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int _getWindowStyle(nint window, int index);
+
+    [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int _getClassName(nint window, StringBuilder className, int count);
+
     // 兼容显式选择在本进程读取的调用方，限制同时挂起的 Windows 调用数量。
     private async Task<SelectionCapture> _readInProcessAsync(nint sourceWindow, CancellationToken token)
     {
         if (_automationRead is { IsCompleted: false })
         {
-            return new(CaptureStatus.Unavailable, Detail: "来源应用的选区接口仍未响应。");
+            return _automationUnavailable("来源应用的选区接口仍未响应。");
         }
         _automationRead = Task.Run(() => _readSelection(sourceWindow));
         try
@@ -158,7 +194,20 @@ public sealed class SelectionReader : IDisposable
         }
         catch (TimeoutException)
         {
-            return new(CaptureStatus.Unavailable, Detail: "来源应用的选区接口响应超时。");
+            return _automationUnavailable("来源应用的选区接口响应超时。");
+        }
+    }
+
+    // 让 UIA 在子进程发出就绪信号前加载，单次预算留给实际的来源控件读取。
+    internal static void _prepareAutomation()
+    {
+        try
+        {
+            _ = AutomationElement.RootElement;
+        }
+        catch (Exception ex) when (ex is COMException or ElementNotAvailableException)
+        {
+            // 桌面暂不可读时仍可送出就绪信号，随后按实际控件的读取结果处理。
         }
     }
 
@@ -169,7 +218,7 @@ public sealed class SelectionReader : IDisposable
         {
             AutomationElement? focused = AutomationElement.FocusedElement;
             AutomationElement? element = focused;
-            for (int depth = 0; element is not null && depth < 4; depth++)
+            for (int depth = 0; element is not null && depth < 12; depth++)
             {
                 if (element.Current.IsPassword)
                 {
@@ -212,17 +261,21 @@ public sealed class SelectionReader : IDisposable
                 }
                 element = TreeWalker.ControlViewWalker.GetParent(element);
             }
-            return new(CaptureStatus.Unavailable);
+            return _automationUnavailable(null);
         }
         catch (ElementNotAvailableException)
         {
-            return new(CaptureStatus.Unavailable, Detail: "来源控件已关闭或切换。");
+            return _automationUnavailable("来源控件已关闭或切换。");
         }
-        catch (COMException)
+        catch (Exception ex) when (ex is COMException or InvalidOperationException)
         {
-            return new(CaptureStatus.Unavailable, Detail: "来源应用的选区接口不可访问。");
+            return _automationUnavailable("来源应用的选区接口不可访问。");
         }
     }
+
+    // UIA 无法取得结果时交给剪贴板，取词入口会再次核对来源，复制前会复查原生密码框。
+    internal static SelectionCapture _automationUnavailable(string? detail) =>
+        new(CaptureStatus.Unavailable, Detail: detail) { FallbackMode = ClipboardFallbackMode.Automatic };
 
     // 取选区最后一条可见行的物理像素边界，供浮窗贴近选区末尾。
     private static System.Drawing.Rectangle? _readSelectionBounds(TextPatternRange range)

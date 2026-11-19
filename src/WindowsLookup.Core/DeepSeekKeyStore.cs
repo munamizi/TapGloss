@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -86,7 +87,14 @@ public sealed class DeepSeekKeyStore
         }
         finally
         {
-            File.Delete(temp);
+            try
+            {
+                File.Delete(temp);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Trace.TraceWarning("清理密钥临时文件失败（{0}）。", ex.GetType().Name);
+            }
         }
     }
 }

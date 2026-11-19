@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Forms = System.Windows.Forms;
@@ -23,8 +24,8 @@ internal static class Program
             return;
         }
 
-        using var instance = new Mutex(initiallyOwned: false, @"Local\WindowsLookup", out bool isNew);
-        if (!isNew)
+        using Mutex? instance = _claimInstance();
+        if (instance is null)
         {
             Forms.MessageBox.Show("查词工具已在系统托盘运行。", "TapGloss", Forms.MessageBoxButtons.OK,
                 Forms.MessageBoxIcon.Information);
@@ -32,13 +33,43 @@ internal static class Program
         }
         WinRT.ComWrappersSupport.InitializeComWrappers();
         LookupApplication? app = null;
-        Application.Start(_ =>
+        try
         {
-            SynchronizationContext.SetSynchronizationContext(
-                new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread()));
-            app = new LookupApplication();
-        });
-        app?._disposeTray();
+            Application.Start(_ =>
+            {
+                SynchronizationContext.SetSynchronizationContext(
+                    new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread()));
+                app = new LookupApplication();
+            });
+        }
+        finally
+        {
+            try
+            {
+                app?._disposeTray();
+            }
+            finally
+            {
+                OutsideClickWatcher._shutdownHookThread();
+            }
+        }
+    }
+
+    // 保留旧版使用的命名锁协议，给正在退出的实例留出短暂时间释放最后一个句柄。
+    private static Mutex? _claimInstance()
+    {
+        long started = Stopwatch.GetTimestamp();
+        do
+        {
+            var instance = new Mutex(initiallyOwned: false, @"Local\WindowsLookup", out bool isNew);
+            if (isNew)
+            {
+                return instance;
+            }
+            instance.Dispose();
+            Thread.Sleep(75);
+        } while (Stopwatch.GetElapsedTime(started) < TimeSpan.FromMilliseconds(1500));
+        return null;
     }
 }
 

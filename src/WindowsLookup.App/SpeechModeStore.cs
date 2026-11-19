@@ -52,7 +52,14 @@ internal sealed class SpeechModeStore
         }
         finally
         {
-            File.Delete(temporary);
+            try
+            {
+                File.Delete(temporary);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Trace.TraceWarning("清理语音模式临时文件失败（{0}）。", ex.GetType().Name);
+            }
         }
     }
 }

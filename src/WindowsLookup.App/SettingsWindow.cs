@@ -31,6 +31,7 @@ internal sealed class SettingsWindow : Window
     private Point _lastAnchor;
     private int _minHeight;
     private int _titleBarHeightOverhead;
+    private uint _titleBarDpi;
 
     /// <summary>
     /// 创建可保存或关闭的设置窗口。
@@ -169,20 +170,8 @@ internal sealed class SettingsWindow : Window
         _root.Measure(new Windows.Foundation.Size(DialogWidth, double.PositiveInfinity));
         int desired = (int)Math.Ceiling(_root.DesiredSize.Height) + 2;
         int targetHeight = Math.Clamp(Math.Max(_minHeight, desired), _minHeight, MaxDialogHeight);
-        int requested = Math.Max(120, targetHeight - _titleBarHeightOverhead);
-        WindowPlacement._place(this, _lastAnchor, DialogWidth, requested, centered: true);
-        if (AppWindow.ClientSize.Width > 0 && AppWindow.ClientSize.Height > 0)
-        {
-            double scale = (double)AppWindow.ClientSize.Width / DialogWidth;
-            double actualLogicalHeight = AppWindow.ClientSize.Height / scale;
-            int delta = (int)Math.Round(actualLogicalHeight - targetHeight);
-            if (Math.Abs(delta) >= 2)
-            {
-                _titleBarHeightOverhead = Math.Clamp(_titleBarHeightOverhead + delta, 0, 64);
-                int adjusted = Math.Max(120, targetHeight - _titleBarHeightOverhead);
-                WindowPlacement._place(this, _lastAnchor, DialogWidth, adjusted, centered: true);
-            }
-        }
+        WindowPlacement._fit(this, _lastAnchor, DialogWidth, targetHeight, minimumHeight: 120, centered: true,
+            ref _titleBarHeightOverhead, ref _titleBarDpi);
     }
 
     // 配置扩展标题栏，隐藏默认应用图标并保持关闭按钮透明融合。

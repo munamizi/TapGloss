@@ -22,12 +22,14 @@ internal static class VirtualDesktop
     internal static bool _isCurrent(Guid desktopId, nint sourceWindow)
     {
         IVirtualDesktopManager? manager = _getManager();
-        if (manager is not null && sourceWindow != 0
-            && manager._getWindowDesktopId(sourceWindow, out Guid sourceDesktop) >= 0
-            && sourceDesktop == desktopId
-            && manager._isWindowOnCurrentVirtualDesktop(sourceWindow, out bool sourceIsCurrent) >= 0)
+        if (manager is not null && sourceWindow != 0 && _getDesktopId(sourceWindow) == desktopId)
         {
-            return sourceIsCurrent && !_isShellCloaked(sourceWindow);
+            int result = manager._isWindowOnCurrentVirtualDesktop(sourceWindow, out bool sourceIsCurrent);
+            if (result >= 0)
+            {
+                return sourceIsCurrent && !_isShellCloaked(sourceWindow);
+            }
+            _resetOnDisconnect(result);
         }
 
         return _getDesktopId(_foregroundWindow()) == desktopId;
@@ -44,13 +46,27 @@ internal static class VirtualDesktop
             return Guid.Empty;
         }
         IVirtualDesktopManager? manager = _getManager();
-        if (manager is not null && manager._getWindowDesktopId(window, out Guid desktopId) >= 0)
+        if (manager is null)
+        {
+            return Guid.Empty;
+        }
+        int result = manager._getWindowDesktopId(window, out Guid desktopId);
+        if (result >= 0)
         {
             return desktopId;
         }
 
-        _manager = null;
+        _resetOnDisconnect(result);
         return Guid.Empty;
+    }
+
+    // 无桌面归属等单次查询失败时保留 COM 对象，只有连接中断才按需重建。
+    private static void _resetOnDisconnect(int result)
+    {
+        if (result is unchecked((int)0x80010108) or unchecked((int)0x800706BA) or unchecked((int)0x80010007))
+        {
+            _manager = null;
+        }
     }
 
     // 同一个界面线程复用 Shell 接口，资源管理器暂不可用时交给调用方新建窗口。

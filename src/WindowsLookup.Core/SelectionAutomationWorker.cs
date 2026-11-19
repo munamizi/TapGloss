@@ -12,6 +12,8 @@ namespace WindowsLookup;
 /// <summary>在可重启的子进程内执行可能卡住的 Windows 选区读取。</summary>
 internal sealed class SelectionAutomationWorker : IDisposable
 {
+    private static readonly TimeSpan StartupBudget = TimeSpan.FromSeconds(3);
+    private const string Ready = "READY";
     private static readonly TimeSpan ReadBudget = TimeSpan.FromMilliseconds(900);
     private static readonly TimeSpan IdleTime = TimeSpan.FromMinutes(1);
     private readonly string _executable;
@@ -39,8 +41,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
     // 一次只接收一份结果，超时或取消时结束进程，避免后续读取收到过期响应。
     internal async Task<SelectionCapture> _readAsync(nint sourceWindow, CancellationToken token)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-        deadline.CancelAfter(ReadBudget);
+        bool waitingForReady = false;
         try
         {
             Process process;
@@ -48,9 +49,22 @@ internal sealed class SelectionAutomationWorker : IDisposable
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 _reading = true;
-                process = _ensureProcess();
+                process = _ensureProcess(out waitingForReady);
             }
 
+            if (waitingForReady)
+            {
+                using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
+                startup.CancelAfter(StartupBudget);
+                if (await process.StandardOutput.ReadLineAsync(startup.Token).ConfigureAwait(false) != Ready)
+                {
+                    throw new IOException("选区读取进程未就绪。");
+                }
+                waitingForReady = false;
+            }
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(ReadBudget);
             await process.StandardInput.WriteLineAsync(
                 sourceWindow.ToInt64().ToString(CultureInfo.InvariantCulture).AsMemory(), deadline.Token)
                 .ConfigureAwait(false);
@@ -60,7 +74,11 @@ internal sealed class SelectionAutomationWorker : IDisposable
             {
                 throw new IOException("选区读取进程已停止。");
             }
-            return new(reply.Status, reply.Text, reply.Detail) { SelectionBounds = reply.Bounds };
+            return new(reply.Status, reply.Text, reply.Detail)
+            {
+                SelectionBounds = reply.Bounds,
+                FallbackMode = reply.FallbackMode,
+            };
         }
         catch (OperationCanceledException)
         {
@@ -68,13 +86,14 @@ internal sealed class SelectionAutomationWorker : IDisposable
             token.ThrowIfCancellationRequested();
             // 界面仍在原窗口时，由取词入口继续尝试安全的剪贴板路径。
             Trace.TraceWarning("选区接口响应超时，已停止读取子进程。");
-            return new(CaptureStatus.Unavailable);
+            return SelectionReader._automationUnavailable(
+                waitingForReady ? "选区读取进程启动超时。" : "来源应用的选区接口响应超时。");
         }
         catch (Exception ex) when (ex is IOException or Win32Exception or InvalidOperationException or JsonException)
         {
             lock (_sync) { _stopProcess(); }
             Trace.TraceWarning("选区读取进程中断（{0}）。", ex.GetType().Name);
-            return new(CaptureStatus.Unavailable, Detail: "选区读取已中断，请再按 Alt+T 重试。");
+            return SelectionReader._automationUnavailable("选区读取已中断。");
         }
         finally
         {
@@ -91,11 +110,12 @@ internal sealed class SelectionAutomationWorker : IDisposable
     }
 
     // 复用正常的读取进程，进程异常退出后按需重新启动。
-    private Process _ensureProcess()
+    private Process _ensureProcess(out bool started)
     {
-        if (_process is { HasExited: false })
+        started = _process is not { HasExited: false };
+        if (!started && _process is { } active)
         {
-            return _process;
+            return active;
         }
         _stopProcess();
         var start = new ProcessStartInfo(_executable)
@@ -162,6 +182,8 @@ internal sealed class SelectionAutomationWorker : IDisposable
     {
         Console.InputEncoding = Encoding.UTF8;
         Console.OutputEncoding = new UTF8Encoding(false);
+        SelectionReader._prepareAutomation();
+        Console.WriteLine(Ready);
         while (Console.ReadLine() is { } line)
         {
             SelectionCapture capture = long.TryParse(line, CultureInfo.InvariantCulture, out long handle)
@@ -169,7 +191,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
                 ? SelectionReader._readSelection((nint)handle)
                 : new(CaptureStatus.Unavailable, Detail: "来源窗口已切换。");
             Console.WriteLine(JsonSerializer.Serialize(
-                new SelectionReply(capture.Status, capture.Text, capture.Detail, capture.SelectionBounds)));
+                new SelectionReply(capture.Status, capture.Text, capture.Detail, capture.SelectionBounds, capture.FallbackMode)));
         }
     }
 
@@ -191,5 +213,6 @@ internal sealed class SelectionAutomationWorker : IDisposable
         }
     }
 
-    private sealed record SelectionReply(CaptureStatus Status, string? Text, string? Detail, Rectangle? Bounds);
+    private sealed record SelectionReply(CaptureStatus Status, string? Text, string? Detail, Rectangle? Bounds,
+        ClipboardFallbackMode FallbackMode);
 }

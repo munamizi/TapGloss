@@ -10,6 +10,8 @@ internal sealed class WindowsTray : IDisposable
     private readonly Icon _trayIcon;
     private readonly Func<TrayMenuWindow> _createMenu;
     private TrayMenuWindow? _menu;
+    private TrayMenuWindow? _menuAtRightDown;
+    private (Point Point, long Time)? _outsideRightRelease;
 
     /// <summary>
     /// 创建托盘图标并绑定密钥设置、模式切换和退出。
@@ -26,16 +28,24 @@ internal sealed class WindowsTray : IDisposable
     internal WindowsTray(string text, Action configureKey, Func<SpeechMemoryMode> currentMode,
         Action<SpeechMemoryMode> selectMode, Action exit)
     {
-        _createMenu = () => new TrayMenuWindow(configureKey, currentMode(), selectMode, exit);
+        _createMenu = () => new TrayMenuWindow(configureKey, currentMode(), selectMode, exit,
+            point => _outsideRightRelease = (point, Environment.TickCount64));
         using Stream iconStream = typeof(WindowsTray).Assembly.GetManifestResourceStream("WindowsLookup.App.TrayIcon.ico")
             ?? throw new InvalidOperationException("缺少内置的托盘图标。");
         _trayIcon = new Icon(iconStream, Forms.SystemInformation.SmallIconSize);
         _icon = new Forms.NotifyIcon { Icon = _trayIcon, Text = text, Visible = true };
+        _icon.MouseDown += (_, args) =>
+        {
+            if (args.Button == Forms.MouseButtons.Right)
+            {
+                _menuAtRightDown = _menu;
+            }
+        };
         _icon.MouseUp += (_, args) =>
         {
             if (args.Button == Forms.MouseButtons.Right)
             {
-                _showMenu();
+                _toggleMenu(Forms.Cursor.Position);
             }
             else
             {
@@ -52,25 +62,40 @@ internal sealed class WindowsTray : IDisposable
         };
     }
 
-    internal bool Visible { get => _icon.Visible; set => _icon.Visible = value; }
     internal bool IsMenuOpen => _menu is not null;
 
     // 使用 Windows 系统通知展示短状态。
     internal void _notify(string title, string message, bool warning = false) =>
         _icon.ShowBalloonTip(3000, title, message, warning ? Forms.ToolTipIcon.Warning : Forms.ToolTipIcon.Info);
 
-    // 在托盘右键的位置打开菜单，再次右键可收起。
-    private void _showMenu()
+    // 同一次右键只能收起按下时的菜单，忽略点外监听先收到的那次松开。
+    private void _toggleMenu(Point point)
     {
-        if (_menu is not null)
+        TrayMenuWindow? previous = _menuAtRightDown ?? _menu;
+        _menuAtRightDown = null;
+        var outsideRelease = _outsideRightRelease;
+        _outsideRightRelease = null;
+        if (previous is not null)
         {
-            _menu._dismiss();
+            previous._dismiss();
             return;
         }
+        if (outsideRelease is { } release && Environment.TickCount64 - release.Time < 150
+            && Math.Abs((long)release.Point.X - point.X) <= 4 && Math.Abs((long)release.Point.Y - point.Y) <= 4)
+        {
+            return;
+        }
+
         var menu = _createMenu();
         _menu = menu;
-        menu.Closed += (_, _) => _menu = null;
-        menu._open(Forms.Cursor.Position);
+        menu.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_menu, menu))
+            {
+                _menu = null;
+            }
+        };
+        menu._open(point);
     }
 
     /// <summary>

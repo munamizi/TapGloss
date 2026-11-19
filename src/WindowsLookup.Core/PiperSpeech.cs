@@ -8,6 +8,8 @@ namespace WindowsLookup;
 /// <summary>通过应用自带的 Piper 进程离线合成 Amy，并在空闲时释放模型。</summary>
 internal sealed class PiperSpeech : IDisposable
 {
+    private static readonly TimeSpan StartupBudget = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan RequestBudget = TimeSpan.FromSeconds(3);
     private const int IdleMilliseconds = 15 * 60 * 1000;
     private readonly SemaphoreSlim _requests = new(1);
     private readonly object _sync = new();
@@ -32,12 +34,14 @@ internal sealed class PiperSpeech : IDisposable
     internal async Task<byte[]> _synthesizeAsync(string word, CancellationToken cancellationToken, bool prewarmOnly = false)
     {
         await _requests.WaitAsync(cancellationToken).ConfigureAwait(false);
-        using var deadline = new CancellationTokenSource();
-        byte[] wave;
+        byte[]? wave = null;
+        bool waitingForReady = false;
+        bool requestStarted = false;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
             Process worker;
+            bool starting;
             lock (_sync)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
@@ -46,32 +50,52 @@ internal sealed class PiperSpeech : IDisposable
                     return [];
                 }
                 _busy = true;
-                worker = _getOrStartWorker();
+                worker = _getOrStartWorker(out starting);
             }
 
-            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            if (starting)
+            {
+                waitingForReady = true;
+                using var startup = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                startup.CancelAfter(StartupBudget);
+                await _readProtocolAsync(worker, waitingForReady: true, startup.Token).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                waitingForReady = false;
+            }
+
+            // 请求发出前可以直接取消，发出后要读完响应才能安全复用进程。
+            cancellationToken.ThrowIfCancellationRequested();
+            requestStarted = true;
+            using var deadline = new CancellationTokenSource(RequestBudget);
             await worker.StandardInput.WriteLineAsync(word.AsMemory(), deadline.Token).ConfigureAwait(false);
             await worker.StandardInput.FlushAsync(deadline.Token).ConfigureAwait(false);
-            string? reply = await worker.StandardOutput.ReadLineAsync(deadline.Token).ConfigureAwait(false);
-            wave = Convert.FromBase64String(reply ?? "");
-            if (wave.Length <= 44 || !wave.AsSpan(0, 4).SequenceEqual("RIFF"u8)
-                || !wave.AsSpan(8, 4).SequenceEqual("WAVE"u8))
+            string reply = await _readProtocolAsync(worker, waitingForReady: false, deadline.Token).ConfigureAwait(false);
+            if (reply != "ERR")
             {
-                throw new InvalidDataException("Piper 未返回有效的一段 WAV。");
-            }
-            lock (_sync)
-            {
-                if (ReferenceEquals(_worker, worker))
+                wave = Convert.FromBase64String(reply[4..]);
+                if (wave.Length <= 44 || !wave.AsSpan(0, 4).SequenceEqual("RIFF"u8)
+                    || !wave.AsSpan(8, 4).SequenceEqual("WAVE"u8))
                 {
-                    _primed = true;
+                    throw new InvalidDataException("Piper 未返回有效的一段 WAV。");
+                }
+                lock (_sync)
+                {
+                    if (ReferenceEquals(_worker, worker))
+                    {
+                        _primed = true;
+                    }
                 }
             }
         }
-        catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (waitingForReady || requestStarted)
         {
             lock (_sync)
             {
                 _stopWorker();
+            }
+            if (waitingForReady)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
             }
             throw new TimeoutException("Amy 发音超时，请重试。", ex);
         }
@@ -81,6 +105,10 @@ internal sealed class PiperSpeech : IDisposable
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 _stopWorker();
+            }
+            if (waitingForReady)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
             }
             if (ex is FileNotFoundException)
             {
@@ -105,7 +133,22 @@ internal sealed class PiperSpeech : IDisposable
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return wave;
+        return wave ?? throw new InvalidOperationException("Amy 无法合成本次单词。");
+    }
+
+    // 忽略第三方库偶尔写入 stdout 的杂项行，EOF 和超时仍由调用方清理进程。
+    private static async Task<string> _readProtocolAsync(Process worker, bool waitingForReady, CancellationToken token)
+    {
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            string line = await worker.StandardOutput.ReadLineAsync(token).ConfigureAwait(false)
+                ?? throw new IOException("Amy 语音进程已停止。");
+            if (waitingForReady ? line == "READY" : line == "ERR" || line.StartsWith("WAV:", StringComparison.Ordinal))
+            {
+                return line;
+            }
+        }
     }
 
     // 判断是否需要在后台重新预热，实际启动由合成队列串行处理。
@@ -148,12 +191,14 @@ internal sealed class PiperSpeech : IDisposable
     }
 
     // 调用方持有 _sync 时，从发布目录启动私有解释器或复用现有进程。
-    private Process _getOrStartWorker()
+    private Process _getOrStartWorker(out bool started)
     {
-        if (_worker is { HasExited: false })
+        if (_worker is { HasExited: false } active)
         {
-            return _worker;
+            started = false;
+            return active;
         }
+        started = true;
         _stopWorker();
 
         string voice = Path.Combine(AppContext.BaseDirectory, "voice");
@@ -171,6 +216,7 @@ internal sealed class PiperSpeech : IDisposable
             CreateNoWindow = true,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
+            RedirectStandardError = true,
             StandardInputEncoding = new UTF8Encoding(false),
             StandardOutputEncoding = Encoding.ASCII,
         };
@@ -180,6 +226,8 @@ internal sealed class PiperSpeech : IDisposable
         start.ArgumentList.Add("-u");
         start.ArgumentList.Add(script);
         _worker = Process.Start(start) ?? throw new IOException("无法启动 Piper。");
+        // 持续排空日志管道，避免第三方库输出阻塞合成。
+        _worker.BeginErrorReadLine();
         return _worker;
     }
 

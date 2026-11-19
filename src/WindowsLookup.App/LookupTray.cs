@@ -70,10 +70,10 @@ internal sealed class LookupTray : IDisposable
         _speech.SetMemoryMode(_speechMode);
         _icon = new WindowsTray(
             _hotkey is null ? "TapGloss · 快捷键未启用" : $"TapGloss · {ShortcutLabel}",
-            async () => await _editKeyAsync(),
+            () => _ = _runMenuActionAsync(_editKeyAsync),
             () => _speechMode,
             _selectSpeechMode,
-            async () => await _exitAsync());
+            () => _ = _runMenuActionAsync(_exitAsync));
         if (shortcutError is not null)
         {
             _icon._notify("快捷键未启用", shortcutError, warning: true);
@@ -183,8 +183,7 @@ internal sealed class LookupTray : IDisposable
                 window._display(anchor, "正在查词", capture.Text ?? "", selectionBounds: selectionBounds);
 
                 // 预计会自动朗读单词时，在等待译文的时间里先加载本地音色。
-                string? word = capture.Text?.Trim();
-                if (word is { Length: > 0 and <= 80 } && !word.Any(char.IsWhiteSpace))
+                if (DeepSeekClient.IsWordCandidate(capture.Text))
                 {
                     _ = _speech.PrepareAsync();
                 }
@@ -243,7 +242,8 @@ internal sealed class LookupTray : IDisposable
     private Task<LookupResult> _translate(SelectionCapture capture, string key)
     {
         string text = capture.Text?.Trim() ?? "";
-        if (_pendingTranslation is { } pending && pending.Text == text && pending.Key == key)
+        if (_pendingTranslation is { } pending && pending.Text == text && pending.Key == key
+            && !pending.Task.IsFaulted && !pending.Task.IsCanceled)
         {
             return pending.Task;
         }
@@ -397,6 +397,19 @@ internal sealed class LookupTray : IDisposable
         }
     }
 
+    // 托盘命令由同步事件发起，异步异常在命令边界记录。
+    private static async Task _runMenuActionAsync(Func<Task> action)
+    {
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning("托盘命令失败（{0}）。", ex.GetType().Name);
+        }
+    }
+
     // 在本地更新加密保存的 Key。
     private async Task _editKeyAsync()
     {
@@ -405,15 +418,15 @@ internal sealed class LookupTray : IDisposable
             return;
         }
         _editingKey = true;
-        _manualCopy = null;
-        _cancelTranslation();
-        _currentLookup?.Cancel();
-        _clearVisibleResult();
-        _window?._hide();
         try
         {
+            _manualCopy = null;
+            _cancelTranslation();
+            _currentLookup?.Cancel();
+            _clearVisibleResult();
+            _window?._hide();
             var key = new PasswordBox { Header = "DeepSeek API Key" };
-            var dialog = new SettingsWindow("TapGloss · 设置 DeepSeek API Key", key, () => _saveKey(key.Password.Trim()));
+            var dialog = new SettingsWindow("TapGloss · 设置 DeepSeek API Key", key, () => _saveKey(key.Password));
             _settingsWindow = dialog;
             dialog._setSaveEnabled(false);
             key.PasswordChanged += (_, _) => dialog._setSaveEnabled(!string.IsNullOrWhiteSpace(key.Password));
@@ -429,6 +442,11 @@ internal sealed class LookupTray : IDisposable
     // 保存密钥和更新状态，失败时把原因交给设置窗口。
     private string? _saveKey(string key)
     {
+        if (DeepSeekClient.GetApiKeyValidationError(key) is { } keyError)
+        {
+            return keyError;
+        }
+        key = key.Trim();
         try
         {
             _keys.Save(key);
@@ -471,27 +489,43 @@ internal sealed class LookupTray : IDisposable
             return;
         }
         _exiting = true;
-        _icon.Visible = false;
-        _clearVisibleResult();
-        _window?._hide();
-        _settingsWindow?.Close();
-        _cancelTranslation();
-        _currentLookup?.Cancel();
         try
         {
-            await _captureTask;
-            await _lookupTask;
-            await _speechTask;
+            _cancelTranslation();
+            _currentLookup?.Cancel();
+            _clearVisibleResult();
+            _window?._hide();
+            _settingsWindow?.Close();
         }
         catch (Exception ex)
         {
-            Trace.TraceWarning("退出时取词结束（{0}）。", ex.GetType().Name);
+            Trace.TraceWarning("准备退出失败（{0}）。", ex.GetType().Name);
+        }
+        try
+        {
+            await Task.WhenAll(_captureTask, _lookupTask, _speechTask);
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning("退出时后台任务结束（{0}）。", ex.GetType().Name);
         }
         finally
         {
-            await _selection.FinishClipboardAsync();
-            Dispose();
-            Application.Current.Exit();
+            try
+            {
+                await _selection.FinishClipboardAsync();
+            }
+            finally
+            {
+                try
+                {
+                    Dispose();
+                }
+                finally
+                {
+                    Application.Current.Exit();
+                }
+            }
         }
     }
 

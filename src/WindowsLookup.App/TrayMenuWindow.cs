@@ -39,11 +39,12 @@ internal sealed class TrayMenuWindow : Window
     ///     currentMode - 打开菜单时选中的 Amy 模式。
     ///     selectMode - 用户选择 Amy 模式后执行的回调。
     ///     exit - 退出程序的回调。
+    ///     outsideRightRelease - 点外右键松开时记录位置的回调。
     /// Returns:
     ///     TrayMenuWindow - 可从托盘位置打开一次的菜单宿主。
     /// </summary>
     internal TrayMenuWindow(Action configureKey, SpeechMemoryMode currentMode,
-        Action<SpeechMemoryMode> selectMode, Action exit)
+        Action<SpeechMemoryMode> selectMode, Action exit, Action<Point> outsideRightRelease)
     {
         var presenter = (OverlappedPresenter)AppWindow.Presenter;
         presenter.SetBorderAndTitleBar(hasBorder: false, hasTitleBar: false);
@@ -63,7 +64,14 @@ internal sealed class TrayMenuWindow : Window
         int style = _getWindowStyle(handle, ExtendedStyle);
         _setWindowStyle(handle, ExtendedStyle, style | LayeredWindow | NoActivateWindow);
         _setWindowAlpha(handle, 0, 0, AlphaAttribute);
-        _outsideClicks = new OutsideClickWatcher(DispatcherQueue, handle, _ => _dismiss(), rightButtonOnRelease: true);
+        _outsideClicks = new OutsideClickWatcher(DispatcherQueue, handle, (_, point, rightButton) =>
+        {
+            if (rightButton && !_closed && !_dismissing)
+            {
+                outsideRightRelease(point);
+            }
+            _dismiss();
+        }, rightButtonOnRelease: true);
 
         var presenterStyle = new Style(typeof(MenuFlyoutPresenter));
         presenterStyle.Setters.Add(new Setter(FrameworkElement.MinWidthProperty, 112d));
@@ -125,6 +133,7 @@ internal sealed class TrayMenuWindow : Window
         {
             _closed = true;
             _stopListeningForDismissal();
+            _outsideClicks.Dispose();
         };
         Content = _anchor;
     }

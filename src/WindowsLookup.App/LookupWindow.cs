@@ -31,6 +31,7 @@ internal sealed partial class LookupWindow : Window
     private nint _foregroundHook;
     private nint _cloakHook;
     private bool _desktopManagedByShell;
+    private int _desktopPolls;
     private readonly TextBlock _heading = new() { IsTextSelectionEnabled = true };
     private readonly TextBlock _body = new() { IsTextSelectionEnabled = true, TextWrapping = TextWrapping.Wrap };
     private readonly Button _speak = new();
@@ -41,6 +42,7 @@ internal sealed partial class LookupWindow : Window
     private int _lastWidth = MinCardWidth;
     private int _lastHeight;
     private int _clientHeightOffset;
+    private uint _clientHeightDpi;
     private bool _hasLoadedOnce;
     private bool _closing;
 
@@ -70,14 +72,20 @@ internal sealed partial class LookupWindow : Window
             _excludeFromTaskbar();
         }
         _outsideClicks = new OutsideClickWatcher(DispatcherQueue, Handle,
-            target => _dismissFromUi(keepManualCopy: target != 0 && target == SourceWindow));
+            (target, _, _) => _dismissFromUi(keepManualCopy: target != 0 && target == SourceWindow));
         SourceWindow = sourceWindow;
         _desktopEvent = _onDesktopEvent;
         if (desktopId != Guid.Empty)
         {
             _desktopWatcher = DispatcherQueue.CreateTimer();
-            _desktopWatcher.Interval = TimeSpan.FromMilliseconds(100);
-            _desktopWatcher.Tick += (_, _) => _updateDesktopVisibility();
+            _desktopWatcher.Tick += (_, _) =>
+            {
+                if (++_desktopPolls == 15)
+                {
+                    _desktopWatcher.Interval = TimeSpan.FromMilliseconds(750);
+                }
+                _updateDesktopVisibility();
+            };
         }
 
         Content = _buildLayout();
@@ -183,6 +191,8 @@ internal sealed partial class LookupWindow : Window
 
         _foregroundHook = _setWinEventHook(ForegroundChanged, ForegroundChanged, 0, _desktopEvent, 0, 0, 0);
         _cloakHook = _setWinEventHook(WindowCloaked, WindowUncloaked, 0, _desktopEvent, 0, 0, 0);
+        _desktopPolls = 0;
+        _desktopWatcher.Interval = TimeSpan.FromMilliseconds(100);
         _desktopWatcher.Start();
     }
 
@@ -318,7 +328,8 @@ internal sealed partial class LookupWindow : Window
     internal void _close()
     {
         _stopDesktopTracking();
-        _outsideClicks._stop();
+        _outsideClicks.Dispose();
+        _root.LayoutUpdated -= _syncDragRegionAfterLayout;
         _closing = true;
         Close();
         if (_desktopOwner != 0)
@@ -451,23 +462,8 @@ internal sealed partial class LookupWindow : Window
         int desiredHeight = Math.Clamp(measured, MinCardHeight, MaxCardHeight);
         _lastHeight = desiredHeight;
 
-        int requested = Math.Max(48, desiredHeight - _clientHeightOffset);
-        WindowPlacement._place(this, anchor, width, requested, centered: false, _lastSelectionBounds);
-        if (AppWindow.ClientSize.Width > 0 && AppWindow.ClientSize.Height > 0)
-        {
-            double scale = _root.XamlRoot?.RasterizationScale ?? (double)AppWindow.ClientSize.Width / width;
-            int extra = (int)Math.Round(AppWindow.ClientSize.Height / scale - desiredHeight);
-            if (Math.Abs(extra) >= 2)
-            {
-                // 某些系统缩放下实际客户区比请求值高，校正后保持卡片紧凑。
-                _clientHeightOffset = Math.Clamp(_clientHeightOffset + extra, 0, 64);
-                int corrected = Math.Max(48, desiredHeight - _clientHeightOffset);
-                if (corrected != requested)
-                {
-                    WindowPlacement._place(this, anchor, width, corrected, centered: false, _lastSelectionBounds);
-                }
-            }
-        }
+        WindowPlacement._fit(this, anchor, width, desiredHeight, minimumHeight: 48, centered: false,
+            ref _clientHeightOffset, ref _clientHeightDpi, _lastSelectionBounds);
     }
 
     // 首次渲染控件模板后，在尺寸偏差时微调一次。
@@ -486,7 +482,7 @@ internal sealed partial class LookupWindow : Window
         }
         _root.Measure(new Windows.Foundation.Size(_lastWidth, double.PositiveInfinity));
         int fitted = Math.Clamp((int)Math.Ceiling(_root.DesiredSize.Height) + 2, MinCardHeight, MaxCardHeight);
-        double clientHeight = AppWindow.ClientSize.Height / _root.XamlRoot.RasterizationScale;
+        double clientHeight = AppWindow.ClientSize.Height / (WindowPlacement._getDpi(Handle) / 96.0);
         if (Math.Abs(fitted - _lastHeight) >= 3 || Math.Abs(clientHeight - fitted) >= 3)
         {
             _placeWithFittedSize(_lastAnchor);
