@@ -28,6 +28,8 @@ internal sealed partial class LookupWindow : Window
     private const string CopyGlyph = "\uE8C8";
     private const string CopiedGlyph = "\uE73E";
     private const string CopyLabel = "复制译文";
+    private const string ReplaceGlyph = "\uE8C6";
+    private const string ReplaceLabel = "替换选中文字";
     private readonly nint _desktopOwner;
     private readonly OutsideClickWatcher _outsideClicks;
     private readonly DispatcherQueueTimer? _desktopWatcher;
@@ -41,9 +43,13 @@ internal sealed partial class LookupWindow : Window
     private readonly Button _speak = new();
     private readonly Button _copy = new() { Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center };
     private readonly FontIcon _copyIcon = new() { Glyph = CopyGlyph, FontSize = 12 };
+    private readonly Button _replace = new() { Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center };
+    private readonly FontIcon _replaceIcon = new() { Glyph = ReplaceGlyph, FontSize = 12 };
     private readonly DispatcherQueueTimer _copyFeedbackTimer;
     private Func<CancellationToken, Task<bool>>? _copyAction;
     private CancellationTokenSource? _copyRequest;
+    private Func<CancellationToken, Task<string?>>? _replaceAction;
+    private CancellationTokenSource? _replaceRequest;
     private readonly TextBlock _notice = new() { Visibility = Visibility.Collapsed };
     private Action? _speakAction;
     private Point _lastAnchor;
@@ -105,6 +111,7 @@ internal sealed partial class LookupWindow : Window
         SystemBackdrop = new MicaBackdrop();
         _speak.Click += (_, _) => _speakAction?.Invoke();
         _copy.Click += (_, _) => _ = _copyResultAsync();
+        _replace.Click += (_, _) => _ = _replaceResultAsync();
         AppWindow.Closing += (_, args) =>
         {
             if (!_closing)
@@ -123,15 +130,17 @@ internal sealed partial class LookupWindow : Window
 
     // 更新本次状态与操作，按内容自适应窗口宽高并保留原应用焦点。
     internal void _display(Point anchor, string heading, string body, Action? speak = null,
-        Rectangle? selectionBounds = null, Func<CancellationToken, Task<bool>>? copy = null)
+        Rectangle? selectionBounds = null, Func<CancellationToken, Task<bool>>? copy = null,
+        Func<CancellationToken, Task<string?>>? replace = null)
     {
-        _resetCopyState();
+        _resetHeaderActions();
         _copyAction = copy;
-        if (copy is not null)
-        {
-            _copy.Visibility = Visibility.Visible;
-            _statusTop.ColumnSpacing = CopyColumnSpacing;
-        }
+        _replaceAction = replace;
+        _copy.Visibility = copy is not null ? Visibility.Visible : Visibility.Collapsed;
+        _replace.Visibility = replace is not null ? Visibility.Visible : Visibility.Collapsed;
+        bool hasActions = copy is not null || replace is not null;
+        _statusActions.Visibility = hasActions ? Visibility.Visible : Visibility.Collapsed;
+        _statusTop.ColumnSpacing = hasActions ? ActionColumnSpacing : 0;
         _lastAnchor = anchor;
         _lastSelectionBounds = selectionBounds;
         _scroll.ChangeView(null, 0, null, disableAnimation: true);
@@ -322,7 +331,7 @@ internal sealed partial class LookupWindow : Window
     // 收起浮窗并清理本次交互，包括已被系统遮蔽的浮窗。
     internal void _hide()
     {
-        _resetCopyState();
+        _resetHeaderActions();
         _stopDesktopTracking();
         _outsideClicks._stop();
         _loadingRing.IsActive = false;
@@ -337,7 +346,7 @@ internal sealed partial class LookupWindow : Window
     // 复制由用户点击触发，换结果或关窗时取消尚未开始的写入并忽略旧反馈。
     private async Task _copyResultAsync()
     {
-        if (_copyAction is not { } copy || _copyRequest is not null)
+        if (_copyAction is not { } copy || _copyRequest is not null || _replaceRequest is not null)
         {
             return;
         }
@@ -392,13 +401,52 @@ internal sealed partial class LookupWindow : Window
         }
     }
 
-    // 停止旧结果的复制回调、反馈和按钮命中区。
-    private void _resetCopyState()
+    // 每个结果同时只接受一次替换，关窗前失败时在本卡片内显示原因。
+    private async Task _replaceResultAsync()
+    {
+        if (_replaceAction is not { } replace || _replaceRequest is not null)
+        {
+            return;
+        }
+        _copyRequest?.Cancel();
+        using var request = new CancellationTokenSource();
+        _replaceRequest = request;
+        try
+        {
+            string? error = await replace(request.Token);
+            if (error is not null && !request.IsCancellationRequested && IsVisible)
+            {
+                _showNotice(error);
+            }
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            Trace.TraceWarning("替换提示未完成（{0}）。", error.GetType().Name);
+        }
+        finally
+        {
+            if (ReferenceEquals(_replaceRequest, request))
+            {
+                _replaceRequest = null;
+            }
+        }
+    }
+
+    // 取消旧结果的按钮请求，清除回调、复制反馈和按钮命中区。
+    private void _resetHeaderActions()
     {
         _copyRequest?.Cancel();
         _copyRequest = null;
         _copyAction = null;
+        _replaceRequest?.Cancel();
+        _replaceRequest = null;
+        _replaceAction = null;
         _copy.Visibility = Visibility.Collapsed;
+        _replace.Visibility = Visibility.Collapsed;
+        _statusActions.Visibility = Visibility.Collapsed;
         _statusTop.ColumnSpacing = 0;
         _nonClientPointer?.ClearRegionRects(NonClientRegionKind.Passthrough);
         _resetCopyFeedback();
@@ -427,7 +475,7 @@ internal sealed partial class LookupWindow : Window
     // 先关 WinUI 浮窗，再销毁同线程的隐藏宿主。
     internal void _close()
     {
-        _resetCopyState();
+        _resetHeaderActions();
         _stopDesktopTracking();
         _outsideClicks.Dispose();
         _root.LayoutUpdated -= _syncDragRegionAfterLayout;
@@ -601,7 +649,7 @@ internal sealed partial class LookupWindow : Window
     }
 
     // 收起本次查词，通知托盘清理请求及朗读状态。
-    private void _dismiss(bool keepManualCopy)
+    internal void _dismiss(bool keepManualCopy)
     {
         _hide();
         Dismissed?.Invoke(keepManualCopy);

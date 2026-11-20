@@ -29,6 +29,7 @@ internal sealed class LookupTray : IDisposable
     private string? _apiKey;
     private string? _keyLoadError;
     private Task _lookupTask = Task.CompletedTask;
+    private Task _replaceTask = Task.CompletedTask;
     private Task<SelectionCapture> _captureTask = Task.FromResult(new SelectionCapture(CaptureStatus.Unavailable));
     private CancellationTokenSource? _currentLookup;
     private (string Text, string Key, TranslationDirection Direction, CancellationTokenSource Lifetime, Task<LookupResult> Task)? _pendingTranslation;
@@ -221,7 +222,9 @@ internal sealed class LookupTray : IDisposable
             }
             LookupResult result = await translation.WaitAsync(token);
             token.ThrowIfCancellationRequested();
-            _showResult(window, anchor, result, selectionBounds, clipboardWindow);
+            nint verifiedFocus = capture.VerifiedFocus != 0 ? capture.VerifiedFocus : sourceFocus;
+            _showResult(window, anchor, result, selectionBounds, clipboardWindow, sourceWindow, verifiedFocus,
+                desktopId, capture.IsTerminal);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -322,15 +325,17 @@ internal sealed class LookupTray : IDisposable
         }
     }
 
-    // 英文译文可复制，英译中单词显示词义和可用音标并自动朗读。
+    // 英文译文可复制或替换原选区，英译中单词显示词义和可用音标并自动朗读。
     private void _showResult(LookupWindow window, Point anchor, LookupResult result, Rectangle? selectionBounds,
-        nint clipboardWindow)
+        nint clipboardWindow, nint sourceWindow, nint sourceFocus, Guid desktopId, bool isTerminal)
     {
         _visibleResult = result;
         if (result.Direction == TranslationDirection.ToEnglish)
         {
             window._display(anchor, "译文", result.Text, selectionBounds: selectionBounds,
-                copy: token => ClipboardFallback.CopyTextAsync(clipboardWindow, result.Text, token));
+                copy: token => ClipboardFallback.CopyTextAsync(clipboardWindow, result.Text, token),
+                replace: token => _replaceResultAsync(window, result, sourceWindow, sourceFocus, clipboardWindow,
+                    desktopId, isTerminal, token));
             return;
         }
         if (!result.IsWord)
@@ -342,6 +347,132 @@ internal sealed class LookupTray : IDisposable
         window._display(anchor, result.Source, body,
             speak: () => _queueSpeech(result), selectionBounds: selectionBounds);
         _queueSpeech(result);
+    }
+
+    // 把关窗前的结果交给浮窗，并跟踪完整任务，退出时等待剪贴板收尾。
+    private Task<string?> _replaceResultAsync(LookupWindow window, LookupResult result, nint sourceWindow,
+        nint sourceFocus, nint clipboardWindow, Guid desktopId, bool isTerminal, CancellationToken token)
+    {
+        if (_exiting || _disposed || !ReferenceEquals(_visibleResult, result))
+        {
+            return Task.FromResult<string?>(null);
+        }
+        if (!_replaceTask.IsCompleted)
+        {
+            return Task.FromResult<string?>("上一笔替换仍在处理，请稍后重试。");
+        }
+        const string desktopError = "原窗口已离开当前桌面，请使用复制按钮。";
+        if (!_canReachSourceDesktop())
+        {
+            return Task.FromResult<string?>(desktopError);
+        }
+
+        var preHideResult = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = window.DispatcherQueue;
+        bool hidden = false;
+        string? switchError = null;
+        _replaceTask = _completeReplacementAsync();
+        return preHideResult.Task;
+
+        // 桌面归属可用时查询 Shell，同时拦截被 Shell 遮蔽的窗口。
+        bool _canReachSourceDesktop() =>
+            !VirtualDesktop._isShellCloaked(sourceWindow)
+            && (desktopId == Guid.Empty || VirtualDesktop._isCurrent(desktopId, sourceWindow));
+
+        // 关窗后由托盘接收失败状态；关窗前由还在显示的卡片提示。
+        async Task _completeReplacementAsync()
+        {
+            try
+            {
+                ReplaceResult outcome = await ClipboardFallback.ReplaceSelectionAsync(sourceWindow, sourceFocus,
+                    clipboardWindow, result.Text, _switchToSourceAndHide, isTerminal, cancellationToken: token);
+                if (!hidden)
+                {
+                    preHideResult.TrySetResult(switchError ?? outcome.Detail);
+                }
+                else if (!_exiting && outcome.Status != ReplaceStatus.Succeeded)
+                {
+                    string message = outcome.Detail ?? "未完成自动替换。";
+                    if (outcome.LeftInClipboard)
+                    {
+                        message += "译文已留在剪贴板，可手动按 Ctrl+V。";
+                    }
+                    _icon._notify("TapGloss", message, warning: true);
+                }
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested && !hidden)
+            {
+            }
+            catch (Exception error)
+            {
+                Trace.TraceWarning("替换译文失败（{0}）。", error.GetType().Name);
+                if (hidden && !_exiting)
+                {
+                    _icon._notify("TapGloss", "未完成自动替换，请检查原窗口和剪贴板。", warning: true);
+                }
+                else
+                {
+                    preHideResult.TrySetResult("未完成自动替换，请使用复制按钮。");
+                }
+            }
+            finally
+            {
+                preHideResult.TrySetResult(null);
+            }
+        }
+
+        // 在同一界面调度帧完成最后一次校验、交回前台以及关窗。
+        Task<bool> _switchToSourceAndHide()
+        {
+            var switched = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!dispatcher.TryEnqueue(() =>
+            {
+                try
+                {
+                    if (token.IsCancellationRequested || _exiting || !ReferenceEquals(_window, window)
+                        || !window.IsVisible || !ReferenceEquals(_visibleResult, result))
+                    {
+                        switched.SetResult(false);
+                        return;
+                    }
+                    if (!ClipboardFallback._isReplaceTargetAvailable(sourceWindow))
+                    {
+                        switchError = "原窗口已关闭、最小化或不可见，请使用复制按钮。";
+                        switched.SetResult(false);
+                        return;
+                    }
+                    if (!_canReachSourceDesktop())
+                    {
+                        switchError = desktopError;
+                        switched.SetResult(false);
+                        return;
+                    }
+
+                    nint foreground = WindowsHotkey._getForegroundWindow();
+                    if (foreground != sourceWindow && foreground != window.Handle)
+                    {
+                        switched.SetResult(false);
+                        return;
+                    }
+                    if (foreground != sourceWindow)
+                    {
+                        ClipboardFallback._setForegroundWindow(sourceWindow);
+                    }
+                    window._dismiss(keepManualCopy: false);
+                    hidden = true;
+                    preHideResult.TrySetResult(null);
+                    switched.SetResult(true);
+                }
+                catch (Exception error)
+                {
+                    switched.TrySetException(error);
+                }
+            }))
+            {
+                switched.SetResult(false);
+            }
+            return switched.Task;
+        }
     }
 
     // 朗读同一结果时合并重复点击，播放结束后可再听一遍。
@@ -507,7 +638,7 @@ internal sealed class LookupTray : IDisposable
         return null;
     }
 
-    // 等待进行中的取词释放剪贴板，再结束消息循环。
+    // 等待取词和译文替换收尾，再释放消息窗口并结束循环。
     private async Task _exitAsync()
     {
         if (_exiting)
@@ -529,7 +660,7 @@ internal sealed class LookupTray : IDisposable
         }
         try
         {
-            await Task.WhenAll(_captureTask, _lookupTask, _speechTask);
+            await Task.WhenAll(_captureTask, _lookupTask, _speechTask, _replaceTask);
         }
         catch (Exception ex)
         {

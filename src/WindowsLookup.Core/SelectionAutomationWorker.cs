@@ -65,9 +65,8 @@ internal sealed class SelectionAutomationWorker : IDisposable
 
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
             deadline.CancelAfter(ReadBudget);
-            await process.StandardInput.WriteLineAsync(
-                sourceWindow.ToInt64().ToString(CultureInfo.InvariantCulture).AsMemory(), deadline.Token)
-                .ConfigureAwait(false);
+            string handle = sourceWindow.ToInt64().ToString(CultureInfo.InvariantCulture);
+            await process.StandardInput.WriteLineAsync(handle.AsMemory(), deadline.Token).ConfigureAwait(false);
             await process.StandardInput.FlushAsync(deadline.Token).ConfigureAwait(false);
             string? line = await process.StandardOutput.ReadLineAsync(deadline.Token).ConfigureAwait(false);
             if (line is null || JsonSerializer.Deserialize<SelectionReply>(line) is not { } reply)
@@ -79,6 +78,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
                 SelectionBounds = reply.Bounds,
                 FallbackMode = reply.FallbackMode,
                 AutomationFocusChecked = reply.AutomationFocusChecked,
+                IsTerminal = reply.IsTerminal,
             };
         }
         catch (OperationCanceledException)
@@ -193,7 +193,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
                 : new(CaptureStatus.Unavailable, Detail: "来源窗口已切换。");
             Console.WriteLine(JsonSerializer.Serialize(
                 new SelectionReply(capture.Status, capture.Text, capture.Detail, capture.SelectionBounds,
-                    capture.FallbackMode, capture.AutomationFocusChecked)));
+                    capture.FallbackMode, capture.AutomationFocusChecked, capture.IsTerminal)));
         }
     }
 
@@ -216,5 +216,5 @@ internal sealed class SelectionAutomationWorker : IDisposable
     }
 
     private sealed record SelectionReply(CaptureStatus Status, string? Text, string? Detail, Rectangle? Bounds,
-        ClipboardFallbackMode FallbackMode, bool AutomationFocusChecked);
+        ClipboardFallbackMode FallbackMode, bool AutomationFocusChecked, bool IsTerminal);
 }

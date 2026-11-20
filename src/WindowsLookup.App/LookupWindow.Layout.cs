@@ -19,7 +19,7 @@ internal sealed partial class LookupWindow
     private const int MaxCardHeight = 320;
     private const double CardSidePadding = 16;
     private const double HorizontalPadding = 2 * CardSidePadding;
-    private const double CopyColumnSpacing = 12;
+    private const double ActionColumnSpacing = 12;
 
     private readonly Grid _root = new();
     private readonly Grid _titleDragArea = new()
@@ -35,6 +35,13 @@ internal sealed partial class LookupWindow
     private readonly Border _wordDivider = new();
     private readonly StackPanel _statusHeader = new() { Spacing = 0, Visibility = Visibility.Collapsed };
     private readonly Grid _statusTop = new();
+    private readonly StackPanel _statusActions = new()
+    {
+        Orientation = Orientation.Horizontal,
+        Spacing = 6,
+        VerticalAlignment = VerticalAlignment.Center,
+        Visibility = Visibility.Collapsed,
+    };
     private readonly StackPanel _statusLine = new()
     {
         Orientation = Orientation.Horizontal,
@@ -66,6 +73,7 @@ internal sealed partial class LookupWindow
         _applyOptionalStyle(_notice, "LookupNoticeTextStyle");
         _applyOptionalStyle(_speak, "LookupCompactButtonStyle");
         _applyOptionalStyle(_copy, "LookupCompactIconButtonStyle");
+        _applyOptionalStyle(_replace, "LookupCompactIconButtonStyle");
 
         _phoneticBadge.Margin = new Thickness(0, 0, 8, 0);
         _wordDivider.Margin = new Thickness(0, 9, 0, 0);
@@ -77,6 +85,9 @@ internal sealed partial class LookupWindow
         _copy.Content = _copyIcon;
         AutomationProperties.SetName(_copy, CopyLabel);
         ToolTipService.SetToolTip(_copy, CopyLabel);
+        _replace.Content = _replaceIcon;
+        AutomationProperties.SetName(_replace, ReplaceLabel);
+        ToolTipService.SetToolTip(_replace, ReplaceLabel);
 
         // 单词结果头：首词直接置于左上角，紧邻音标胶囊与同排发音操作。
         _phoneticBadge.Child = _phonetic;
@@ -99,8 +110,10 @@ internal sealed partial class LookupWindow
         _statusTop.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         _statusTop.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         _statusTop.Children.Add(_statusLine);
-        _statusTop.Children.Add(_copy);
-        Grid.SetColumn(_copy, 1);
+        _statusActions.Children.Add(_copy);
+        _statusActions.Children.Add(_replace);
+        _statusTop.Children.Add(_statusActions);
+        Grid.SetColumn(_statusActions, 1);
         _statusHeader.Children.Add(_statusTop);
         _statusHeader.Children.Add(_statusDivider);
 
@@ -146,7 +159,7 @@ internal sealed partial class LookupWindow
             }
         };
         _titleDragArea.SizeChanged += (_, _) => _syncDragRegion();
-        _copy.SizeChanged += (_, _) => _syncDragRegion();
+        _statusActions.SizeChanged += (_, _) => _syncDragRegion();
         _root.Loaded += (_, _) => _fitAfterFirstLoad();
         return _root;
     }
@@ -171,7 +184,7 @@ internal sealed partial class LookupWindow
         return panel;
     }
 
-    // 保留顶部留白拖动，左右分别避开单词和复制按钮。
+    // 保留顶部留白拖动，左右分别避开单词和标题栏按钮组。
     private void _updateDragRegion(bool isWordMode)
     {
         double leftOffset = 0;
@@ -180,15 +193,16 @@ internal sealed partial class LookupWindow
             _heading.Measure(new Windows.Foundation.Size(MaxCardWidth - HorizontalPadding, double.PositiveInfinity));
             leftOffset = Math.Min(MaxCardWidth, Math.Ceiling(_heading.DesiredSize.Width) + 20);
         }
-        bool copyVisible = _copy.Visibility == Visibility.Visible;
+        bool actionsVisible = _statusActions.Visibility == Visibility.Visible;
         double rightOffset = 0;
-        if (copyVisible)
+        if (actionsVisible)
         {
-            _copy.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
-            rightOffset = Math.Max(_copy.ActualWidth, _copy.DesiredSize.Width) + CardSidePadding + 4;
+            _statusActions.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+            double actionsWidth = _statusActions.DesiredSize.Width;
+            rightOffset = (actionsWidth > 0 ? actionsWidth : _statusActions.ActualWidth) + CardSidePadding + 4;
         }
         bool marginChanged = _titleDragArea.Margin.Left != leftOffset || _titleDragArea.Margin.Right != rightOffset;
-        if (marginChanged || copyVisible)
+        if (marginChanged || actionsVisible)
         {
             _root.LayoutUpdated -= _syncDragRegionAfterLayout;
             _root.LayoutUpdated += _syncDragRegionAfterLayout;
@@ -197,9 +211,9 @@ internal sealed partial class LookupWindow
         {
             _titleDragArea.Margin = new Thickness(leftOffset, 0, rightOffset, 0);
         }
-        if (copyVisible && _copy.ActualWidth > 0)
+        if (actionsVisible && _statusActions.ActualWidth > 0)
         {
-            // 复用同宽浮窗时可能没有新一轮布局，立即恢复已清除的复制按钮命中区。
+            // 复用同宽浮窗时可能没有新一轮布局，立即恢复按钮组命中区。
             _syncDragRegion();
         }
     }
@@ -236,13 +250,13 @@ internal sealed partial class LookupWindow
             _nonClientPointer.ClearRegionRects(NonClientRegionKind.Caption);
         }
 
-        if (_copy.Visibility == Visibility.Visible && _copy.ActualWidth > 0 && _copy.ActualHeight > 0)
+        if (_statusActions.Visibility == Visibility.Visible && _statusActions.ActualWidth > 0 && _statusActions.ActualHeight > 0)
         {
-            var origin = _copy.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point());
+            var origin = _statusActions.TransformToVisual(_root).TransformPoint(new Windows.Foundation.Point());
             int left = (int)Math.Floor(origin.X * scale);
             int top = (int)Math.Floor(origin.Y * scale);
-            int right = (int)Math.Ceiling((origin.X + _copy.ActualWidth) * scale);
-            int bottom = (int)Math.Ceiling((origin.Y + _copy.ActualHeight) * scale);
+            int right = (int)Math.Ceiling((origin.X + _statusActions.ActualWidth) * scale);
+            int bottom = (int)Math.Ceiling((origin.Y + _statusActions.ActualHeight) * scale);
             _nonClientPointer.SetRegionRects(NonClientRegionKind.Passthrough, [new RectInt32(left, top, right - left, bottom - top)]);
         }
         else

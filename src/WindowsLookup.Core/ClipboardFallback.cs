@@ -14,8 +14,8 @@ internal enum EditorCopySelection
     Ambiguous,
 }
 
-/// <summary>临时复制和恢复剪贴板以读取选区，也可写入用户主动复制的译文。</summary>
-public static class ClipboardFallback
+/// <summary>通过剪贴板读取选区、复制译文或将译文粘贴回来源窗口。</summary>
+public static partial class ClipboardFallback
 {
     private const uint UnicodeText = 13;
     private const uint BitmapFormat = 2;
@@ -312,7 +312,7 @@ public static class ClipboardFallback
                 }
                 if (_afterFocusRecheck(updated, () => _canProbeNoSelection(sourceWindow), out quickProbe) is { } result)
                 {
-                    return result;
+                    return result.Status == CaptureStatus.Selected ? result with { VerifiedFocus = focus } : result;
                 }
                 verifiedFocus = focus;
             }
@@ -340,8 +340,9 @@ public static class ClipboardFallback
             {
                 return null;
             }
-            return await _copyAndRestoreAsync(sourceWindow, clipboardWindow, sendFocus, sourceProcess,
+            SelectionCapture copied = await _copyAndRestoreAsync(sourceWindow, clipboardWindow, sendFocus, sourceProcess,
                 contentProcess, sequence, data, quickProbe).ConfigureAwait(false);
+            return copied.Status == CaptureStatus.Copied ? copied with { VerifiedFocus = sendFocus } : copied;
         }
     }
 
@@ -472,12 +473,8 @@ public static class ClipboardFallback
         nint sourceFocus, uint sourceProcess, uint contentProcess, uint previousSequence,
         List<(uint Format, nint Handle)> previousData, bool quickProbe)
     {
-        Input[] down = [_key(Control, 0), _key(CopyKey, 0)];
-        Input[] up = [_key(CopyKey, KeyUp), _key(Control, KeyUp)];
-        int inputSize = Marshal.SizeOf<Input>();
         long sentAt = Stopwatch.GetTimestamp();
-        (bool pressed, bool released) = await _sendCopyChordAsync(
-            keyUp => _sendInput(2, keyUp ? up : down, inputSize), () => Task.Delay(15)).ConfigureAwait(false);
+        (bool pressed, bool released) = await _sendControlChordAsync(CopyKey).ConfigureAwait(false);
         if (!pressed)
         {
             return new(CaptureStatus.Unavailable, Detail: "来源应用未接受复制。");
@@ -508,9 +505,21 @@ public static class ClipboardFallback
     internal static TimeSpan _receiveBudget(bool quickProbe, bool hasBackup) =>
         TimeSpan.FromMilliseconds(quickProbe ? 350 : hasBackup ? 1200 : 650);
 
-    // Ctrl 和 C 分两拍注入；等待失败或只按下一部分时也发送释放，释放不完整时补发。
-    internal static async Task<(bool Pressed, bool Released)> _sendCopyChordAsync(
-        Func<bool, uint> sendKeys, Func<Task> hold)
+    // 构造指定 Ctrl 组合键的按下和释放输入。
+    private static Task<(bool Pressed, bool Released)> _sendControlChordAsync(ushort key)
+    {
+        Input[] down = [_key(Control, 0), _key(key, 0)];
+        Input[] up = [_key(key, KeyUp), _key(Control, KeyUp)];
+        int inputSize = Marshal.SizeOf<Input>();
+        return _sendChordAsync(keyUp => _sendInput(2, keyUp ? up : down, inputSize), () => Task.Delay(15));
+    }
+
+    // 保留复制流程的组合键测试入口。
+    internal static Task<(bool Pressed, bool Released)> _sendCopyChordAsync(Func<bool, uint> sendKeys, Func<Task> hold) =>
+        _sendChordAsync(sendKeys, hold);
+
+    // 分两拍注入组合键，等待失败或只按下一部分时也释放，释放不完整时补发。
+    internal static async Task<(bool Pressed, bool Released)> _sendChordAsync(Func<bool, uint> sendKeys, Func<Task> hold)
     {
         uint pressed = 0;
         uint released = 0;
@@ -743,70 +752,87 @@ public static class ClipboardFallback
         || (WindowsHotkey._getForegroundWindow() != sourceWindow
             && (clipboardOwner == sourceWindow || _getAncestor(clipboardOwner, RootWindow) == sourceWindow));
 
-    // 逐项备份已知自包含的数据，遇到其他格式或普通格式读取失败时继续备份。
-    private static List<(uint Format, nint Handle)>? _snapshot(out string? failure, CancellationToken token)
+    // 先枚举当前格式，再读取数据，避免延迟渲染增补格式时影响枚举。
+    private static List<(uint Format, nint Handle)>? _snapshot(out string? failure, CancellationToken token,
+        bool requireRestorable = false)
+    {
+        var formats = new List<(uint Format, string Label)>();
+        bool hasFormats = false;
+        uint format = 0;
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            Marshal.SetLastPInvokeError(0);
+            format = _nextFormat(format);
+            if (format == 0)
+            {
+                if (Marshal.GetLastPInvokeError() != 0)
+                {
+                    failure = "Windows 未能列出剪贴板格式。";
+                    return null;
+                }
+                break;
+            }
+
+            hasFormats = true;
+            string label = _formatLabel(format);
+            if (_isSnapshotFormat(format, label))
+            {
+                formats.Add((format, label));
+            }
+        }
+
+        return _backupClipboardFormats(formats, hasFormats, requireRestorable, token, _getClipboardData,
+            _dataSize, _duplicateData, _freeBackup, out failure);
+    }
+
+    // 普通格式失败时继续备份，隐私标记丢失或非空剪贴板完全无法恢复时拒绝替换。
+    internal static List<(uint Format, nint Handle)>? _backupClipboardFormats(List<(uint Format, string Label)> formats,
+        bool hasFormats, bool requireRestorable, CancellationToken token, Func<uint, nint> getData,
+        Func<uint, nint, nuint> dataSize, Func<uint, nint, nuint, nint> duplicateData,
+        Action<List<(uint Format, nint Handle)>> freeBackup, out string? failure)
     {
         var snapshot = new List<(uint Format, nint Handle)>();
         failure = "未能备份原剪贴板。";
         nuint totalSize = 0;
         try
         {
-            // 先记录要备份的格式，避免延迟渲染时增补格式影响本次枚举。
-            var formats = new List<(uint Format, string Label)>();
-            uint format = 0;
-            while (true)
-            {
-                token.ThrowIfCancellationRequested();
-                Marshal.SetLastPInvokeError(0);
-                format = _nextFormat(format);
-                if (format == 0)
-                {
-                    if (Marshal.GetLastPInvokeError() != 0)
-                    {
-                        failure = "Windows 未能列出剪贴板格式。";
-                        return null;
-                    }
-                    break;
-                }
-
-                string label = _formatLabel(format);
-                if (_isSnapshotFormat(format, label))
-                {
-                    formats.Add((format, label));
-                }
-            }
-
             _prioritizeBitmapFormats(formats);
             bool bitmapBackedUp = false;
-            foreach (var (dataFormat, label) in formats)
+            foreach (var (format, label) in formats)
             {
                 token.ThrowIfCancellationRequested();
-                if (bitmapBackedUp && _isBitmapFamily(dataFormat))
+                if (bitmapBackedUp && _isBitmapFamily(format))
                 {
                     continue;
                 }
-                nint handle = _getClipboardData(dataFormat);
+
+                nint handle = getData(format);
                 token.ThrowIfCancellationRequested();
-                nuint size = _dataSize(dataFormat, handle);
+                nuint size = dataSize(format, handle);
                 if (size > MaxClipboardBytes - totalSize)
                 {
                     failure = "原剪贴板的数据超出 128 MiB 备份上限。";
                     return null;
                 }
 
-                nint duplicate = _duplicateData(dataFormat, handle, size);
+                nint duplicate = duplicateData(format, handle, size);
                 if (duplicate != 0)
                 {
-                    snapshot.Add((dataFormat, duplicate));
+                    snapshot.Add((format, duplicate));
                     totalSize += size;
-                    bitmapBackedUp |= _isBitmapFamily(dataFormat);
+                    bitmapBackedUp |= _isBitmapFamily(format);
                 }
                 else if (PrivacyFormats.Contains(label))
                 {
-                    // 隐私标记无法复制时保留原剪贴板，避免恢复的数据失去原有的历史或云端限制。
                     failure = "未能备份原剪贴板的隐私标记。";
                     return null;
                 }
+            }
+            if (requireRestorable && hasFormats && snapshot.Count == 0)
+            {
+                failure = "原剪贴板中没有可还原的数据格式。";
+                return null;
             }
             failure = null;
             return snapshot;
@@ -815,7 +841,7 @@ public static class ClipboardFallback
         {
             if (failure is not null)
             {
-                _freeBackup(snapshot);
+                freeBackup(snapshot);
             }
         }
     }

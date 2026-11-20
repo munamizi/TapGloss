@@ -36,6 +36,12 @@ public sealed record SelectionCapture(CaptureStatus Status, string? Text = null,
 
     [System.Text.Json.Serialization.JsonIgnore]
     public System.Drawing.Rectangle? SelectionBounds { get; internal init; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    internal bool IsTerminal { get; init; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    internal nint VerifiedFocus { get; init; }
 }
 
 /// <summary>按需读取热键触发时的前台选区。</summary>
@@ -108,7 +114,7 @@ public sealed class SelectionReader : IDisposable
     ///     sourceFocus - 热键触发时的焦点控件句柄，0 表示进入读取时再获取。
     ///     shortcutLabel - 剪贴板超时时提示的快捷键，默认 Alt+T
     /// Returns:
-    ///     SelectionCapture - 选中文字和可用的位置，或相应的失败状态
+    ///     SelectionCapture - 选中文字、可用的位置和最后核验的焦点，或相应的失败状态。
     /// </summary>
     public async Task<SelectionCapture> CaptureAsync(nint sourceWindow, nint clipboardWindow,
         CancellationToken cancellationToken = default, uint previousManualSequence = 0, nint sourceFocus = 0,
@@ -151,7 +157,7 @@ public sealed class SelectionReader : IDisposable
             }
             if (!useClipboard)
             {
-                return capture;
+                return capture.Status == CaptureStatus.Selected ? capture with { VerifiedFocus = readFocus } : capture;
             }
             if (focusMoved && !capture.AutomationFocusChecked)
             {
@@ -166,7 +172,9 @@ public sealed class SelectionReader : IDisposable
                         recheckFocus: retryToken => _readAutomationAsync(sourceWindow, retryToken)),
                 cancellationToken, shortcutLabel).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            return fallback;
+            return fallback.Status is CaptureStatus.Selected or CaptureStatus.Copied
+                ? fallback with { VerifiedFocus = fallback.VerifiedFocus != 0 ? fallback.VerifiedFocus : readFocus }
+                : fallback;
         }
         finally
         {
@@ -208,7 +216,7 @@ public sealed class SelectionReader : IDisposable
     [DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern int _getClassName(nint window, StringBuilder className, int count);
 
-    // 初次读取和复制前的焦点复查共用 UIA 子进程，取消收尾时也保持请求串行。
+    // 选区读取请求共用 UIA 子进程，取消收尾时也保持请求串行。
     private async Task<SelectionCapture> _readAutomationAsync(nint sourceWindow, CancellationToken token)
     {
         await _automationGate.WaitAsync(token).ConfigureAwait(false);
@@ -255,7 +263,7 @@ public sealed class SelectionReader : IDisposable
         }
     }
 
-    // 只沿焦点控件向上找文本控件，避免读到窗口其他位置的选区。
+    // 读取焦点控件的选区，并沿祖先识别终端。
     internal static SelectionCapture _readSelection(nint sourceWindow)
     {
         try
@@ -269,7 +277,8 @@ public sealed class SelectionReader : IDisposable
             bool numberedTerminalName = ClipboardFallback._isVsCodeEditor(sourceWindow);
             return _scanFocusChain(focused, element => TreeWalker.ControlViewWalker.GetParent(element),
                 (element, depth) => _isAutomationTerminal(element, depth == 0, numberedTerminalName),
-                _readAutomationElement, () => sourceWindow == WindowsHotkey._getForegroundWindow()
+                _readAutomationElement,
+                () => sourceWindow == WindowsHotkey._getForegroundWindow()
                     && Equals(focused, AutomationElement.FocusedElement));
         }
         catch (ElementNotAvailableException)
@@ -282,13 +291,14 @@ public sealed class SelectionReader : IDisposable
         }
     }
 
-    // 首个文本控件没有选区时仍检查剩余祖先，避免向内嵌终端自动发 Ctrl+C。
+    // 即使已取得选区，也检查剩余祖先以识别内嵌终端。
     internal static SelectionCapture _scanFocusChain<T>(T focused, Func<T, T?> getParent,
         Func<T, int, bool> isTerminal, Func<T, bool, SelectionCapture?> readElement, Func<bool> isStillFocused)
         where T : class
     {
         bool terminal = false;
         bool emptySelection = false;
+        bool selectionRead = false;
         try
         {
             T? element = focused;
@@ -311,7 +321,24 @@ public sealed class SelectionReader : IDisposable
                         emptySelection = true;
                         break;
                     case CaptureStatus.Selected:
-                        return isStillFocused() ? capture! : _automationFocusChanged();
+                        selectionRead = true;
+                        try
+                        {
+                            for (int ancestorDepth = depth + 1; !terminal && ancestorDepth < 12; ancestorDepth++)
+                            {
+                                element = getParent(element!);
+                                if (element is null)
+                                {
+                                    break;
+                                }
+                                terminal = isTerminal(element, ancestorDepth);
+                            }
+                        }
+                        catch (Exception ex) when (ex is COMException or ElementNotAvailableException or InvalidOperationException)
+                        {
+                            // 已读取选区时保留文本，粘贴前仍会检查当时可访问的焦点与祖先。
+                        }
+                        return isStillFocused() ? capture! with { IsTerminal = terminal } : _automationFocusChanged();
                     case not null:
                         return capture!;
                 }
@@ -341,7 +368,7 @@ public sealed class SelectionReader : IDisposable
             }
             string detail = ex is ElementNotAvailableException
                 ? "来源控件已关闭或切换。" : "来源应用的选区接口不可访问。";
-            return emptySelection ? new(CaptureStatus.Unavailable, Detail: detail) : _automationUnavailable(detail);
+            return emptySelection || selectionRead ? new(CaptureStatus.Unavailable, Detail: detail) : _automationUnavailable(detail);
         }
     }
 
