@@ -16,8 +16,9 @@
     <AssemblyName>TapGloss</AssemblyName>
     <AssemblyTitle>TapGloss</AssemblyTitle>
     <Product>TapGloss</Product>
-    <Version>0.5.15</Version>
+    <Version>0.5.16</Version>
     <Description>TapGloss</Description>
+    <AmyVoiceBundle Condition="'$(AmyVoiceBundle)' == ''">$(PiperVoiceBundle)</AmyVoiceBundle>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="$(ApplicationIcon)" LogicalName="WindowsLookup.App.TrayIcon.ico" />
@@ -31,21 +32,30 @@
           DestinationFolder="$(PublishDir)"
           SkipUnchangedFiles="true" />
   </Target>
-  <!-- 发布包内必须包含唯一音色 Amy 的模型和运行环境。 -->
-  <Target Name="CheckPiperVoiceBundle" BeforeTargets="PrepareForPublish">
-    <Error Condition="'$(PiperVoiceBundle)' == '' Or !Exists('$(PiperVoiceBundle)\en_US-amy-medium.onnx') Or !Exists('$(PiperVoiceBundle)\en_US-amy-medium.onnx.json') Or !Exists('$(PiperVoiceBundle)\python\python.exe') Or !Exists('$(PiperVoiceBundle)\packages\piper\__init__.py')"
-           Text="请通过 PiperVoiceBundle 指定完整的 Amy 离线语音目录。" />
-  </Target>
-  <Target Name="CopyPiperVoiceToPublish" AfterTargets="Publish">
+  <!-- 校验模型、词表和发音数据，再由真实发布程序加载并合成。 -->
+  <Target Name="CheckAmyVoiceBundle" BeforeTargets="PrepareForPublish">
+    <Error Condition="'$(AmyVoiceBundle)' == ''" Text="请通过 AmyVoiceBundle 指定完整的 Amy 离线模型目录。" />
     <ItemGroup>
-      <_PiperVoiceFiles Include="$(PiperVoiceBundle)\**\*"
-                       Exclude="$(PiperVoiceBundle)\**\__pycache__\**\*;$(PiperVoiceBundle)\packages\bin\**\*;$(PiperVoiceBundle)\python\include\**\*;$(PiperVoiceBundle)\python\libs\**\*" />
+      <_AmyRequired Include="en_US-amy-medium.onnx;tokens.txt;espeak-ng-data\phontab;espeak-ng-data\phonindex;espeak-ng-data\phondata;espeak-ng-data\intonations" />
     </ItemGroup>
-    <Copy SourceFiles="@(_PiperVoiceFiles)"
-          DestinationFiles="@(_PiperVoiceFiles->'$(PublishDir)voice\%(RecursiveDir)%(Filename)%(Extension)')"
+    <Error Condition="!Exists('$(AmyVoiceBundle)\%(_AmyRequired.Identity)')"
+           Text="Amy 语音包缺少文件：%(_AmyRequired.Identity)" />
+  </Target>
+  <Target Name="CopyAmyVoiceToPublish" AfterTargets="Publish">
+    <Error Condition="Exists('$(PublishDir)voice\python') Or Exists('$(PublishDir)voice\packages') Or Exists('$(PublishDir)voice\worker.py')"
+           Text="发布目录含旧语音运行时，请用新的发布目录生成 Amy 静态数据包。" />
+    <ItemGroup>
+      <_AmyModelFiles Include="$(AmyVoiceBundle)\en_US-amy-medium.onnx;$(AmyVoiceBundle)\tokens.txt" />
+      <_AmyModelFiles Include="$(AmyVoiceBundle)\MODEL_CARD" Condition="Exists('$(AmyVoiceBundle)\MODEL_CARD')" />
+      <_AmyEspeakFiles Include="$(AmyVoiceBundle)\espeak-ng-data\**\*"
+                       Exclude="$(AmyVoiceBundle)\espeak-ng-data\**\*.exe;$(AmyVoiceBundle)\espeak-ng-data\**\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_AmyModelFiles)" DestinationFolder="$(PublishDir)voice" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_AmyEspeakFiles)"
+          DestinationFiles="@(_AmyEspeakFiles->'$(PublishDir)voice\espeak-ng-data\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\..\..\tools\WindowsLookup.Piper\worker.py"
-          DestinationFolder="$(PublishDir)voice"
-          SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="VerifyPublishedAmyVoice" AfterTargets="CopyAmyVoiceToPublish" Condition="'$(SkipVoiceSelfTest)' != 'true'">
+    <Exec Command="&quot;.\$(AssemblyName).exe&quot; --speech-selftest" WorkingDirectory="$(PublishDir)" />
   </Target>
 </Project>

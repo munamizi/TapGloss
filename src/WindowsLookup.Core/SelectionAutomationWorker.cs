@@ -15,8 +15,9 @@ internal sealed class SelectionAutomationWorker : IDisposable
     private static readonly TimeSpan StartupBudget = TimeSpan.FromSeconds(3);
     private const string Ready = "READY";
     private static readonly TimeSpan ReadBudget = TimeSpan.FromMilliseconds(900);
-    private static readonly TimeSpan IdleTime = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan IdleTime = TimeSpan.FromMinutes(15);
     private readonly string _executable;
+    private readonly TimeSpan _idleTime;
     private readonly object _sync = new();
     private readonly Timer _idleTimer;
     private Process? _process;
@@ -29,12 +30,14 @@ internal sealed class SelectionAutomationWorker : IDisposable
     ///
     /// Args:
     ///     executable - 支持内部选区读取模式的可执行文件。
+    ///     idleTime - 完成读取后保留子进程的时间，默认 15 分钟。
     /// Returns:
     ///     SelectionAutomationWorker - 在首次取词时启动子进程。
     /// </summary>
-    internal SelectionAutomationWorker(string executable)
+    internal SelectionAutomationWorker(string executable, TimeSpan? idleTime = null)
     {
         _executable = executable;
+        _idleTime = idleTime ?? IdleTime;
         _idleTimer = new Timer(_releaseIdle);
     }
 
@@ -104,7 +107,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
                 if (!_disposed && _process is not null)
                 {
                     _lastRead = Stopwatch.GetTimestamp();
-                    _idleTimer.Change(IdleTime, Timeout.InfiniteTimeSpan);
+                    _idleTimer.Change(_idleTime, Timeout.InfiniteTimeSpan);
                 }
             }
         }
@@ -142,7 +145,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
             {
                 return;
             }
-            TimeSpan remaining = IdleTime - Stopwatch.GetElapsedTime(_lastRead);
+            TimeSpan remaining = _idleTime - Stopwatch.GetElapsedTime(_lastRead);
             if (remaining <= TimeSpan.Zero)
             {
                 _stopProcess();

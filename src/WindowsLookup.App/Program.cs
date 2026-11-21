@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Forms = System.Windows.Forms;
@@ -8,12 +9,12 @@ namespace WindowsLookup.App;
 internal static class Program
 {
     /// <summary>
-    /// 启动单实例查词托盘并运行 Windows 消息循环。
+    /// 分流选区与语音子进程、自检和单实例托盘入口。
     ///
     /// Args:
-    ///     args - 启动参数，内部模式用于在独立进程读取选区。
+    ///     args - 托盘或内部工作模式的启动参数。
     /// Returns:
-    ///     无返回值，退出消息循环或完成选区读取服务后结束。
+    ///     无返回值，语音子进程与发布自检会设置进程退出码。
     /// </summary>
     [STAThread]
     public static void Main(string[] args)
@@ -21,6 +22,28 @@ internal static class Program
         if (args is ["--selection-worker"])
         {
             Task.Run(SelectionReader.RunWorker).GetAwaiter().GetResult();
+            return;
+        }
+
+        if (args is ["--speech-selftest"])
+        {
+            Environment.ExitCode = AmericanSpeech.RunSelfTest();
+            return;
+        }
+        if (args is ["--speech-worker", ..])
+        {
+            Environment.ExitCode = 2;
+            if (args is [_, string pipe, string parent]
+                && int.TryParse(parent, NumberStyles.None, CultureInfo.InvariantCulture, out int parentPid)
+                && parentPid > 0)
+            {
+                string prefix = $"TapGloss.Speech.{parentPid}.";
+                if (pipe.StartsWith(prefix, StringComparison.Ordinal)
+                    && Guid.TryParseExact(pipe.AsSpan(prefix.Length), "N", out _))
+                {
+                    Environment.ExitCode = AmericanSpeech.RunWorker(pipe, parentPid);
+                }
+            }
             return;
         }
 

@@ -112,7 +112,17 @@ public sealed partial class DeepSeekClient
     /// Returns:
     ///     bool - 可按单词翻译时为 true。
     /// </summary>
-    public static bool IsWordCandidate(string? text) => _getWord(text?.Trim() ?? "") is not null;
+    public static bool IsWordCandidate(string? text) => NormalizeWordCandidate(text) is not null;
+
+    /// <summary>
+    /// 取得英译中和 Amy 朗读共用的规范化单词。
+    ///
+    /// Args:
+    ///     text - 选区原文，可带空白、外层引号或句末标点。
+    /// Returns:
+    ///     单词 - 保留原始大小写并统一连字符，无法作为单词翻译时返回 null。
+    /// </summary>
+    public static string? NormalizeWordCandidate(string? text) => _getWord(text?.Trim() ?? "");
 
     /// <summary>
     /// 校验 DeepSeek API Key 是否能用作请求凭据。
@@ -180,7 +190,7 @@ public sealed partial class DeepSeekClient
         }
         string key = apiKey.Trim();
 
-        string? word = direction == TranslationDirection.ToChinese ? _getWord(text) : null;
+        string? word = direction == TranslationDirection.ToChinese ? NormalizeWordCandidate(text) : null;
         bool isWord = word is not null;
         text = word ?? text;
         var cacheEntry = (Direction: direction, Text: text);

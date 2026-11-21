@@ -21,7 +21,7 @@ internal sealed class LookupTray : IDisposable
     private readonly DeepSeekClient _translations = new();
     private readonly DeepSeekKeyStore _keys = new();
     private readonly SpeechModeStore _speechModeStore = new();
-    private readonly AmericanSpeech _speech = new();
+    private readonly AmericanSpeech _speech = new(Environment.ProcessPath);
     private SpeechMemoryMode _speechMode;
     private Task _speechTask = Task.CompletedTask;
     private LookupResult? _queuedSpeech;
@@ -82,8 +82,13 @@ internal sealed class LookupTray : IDisposable
             _icon._notify("快捷键未启用", string.Join(Environment.NewLine, shortcutErrors), warning: true);
         }
 
-        // 英译中入口启用时，在后台静默预热 Amy。
-        if (_chineseHotkey is not null)
+        // 模型包残缺时提示缺项，完整且热键可用时在后台预热。
+        if (AmySpeechClient.ValidateVoiceBundle() is { } missingVoiceFile)
+        {
+            SpeechDiagnostics._record("bundle-check", SpeechFailureKind.BundleIncomplete);
+            _icon._notify("Amy 语音文件不完整", $"缺少 {missingVoiceFile}，请使用完整发布包。", warning: true);
+        }
+        else if (_chineseHotkey is not null)
         {
             _ = _speech.PrepareAsync();
         }
@@ -214,10 +219,11 @@ internal sealed class LookupTray : IDisposable
             {
                 window._display(anchor, "正在查词", capture.Text ?? "", selectionBounds: selectionBounds);
 
-                // 预计会自动朗读单词时，在等待译文的时间里先加载本地音色。
-                if (direction == TranslationDirection.ToChinese && DeepSeekClient.IsWordCandidate(capture.Text))
+                // 网络请求进行时预合成同一个词，音频可供译文弹出后的朗读复用。
+                if (direction == TranslationDirection.ToChinese
+                    && DeepSeekClient.NormalizeWordCandidate(capture.Text) is { } word)
                 {
-                    _ = _speech.PrepareAsync();
+                    _ = _speech.PrepareWordAsync(word);
                 }
             }
             LookupResult result = await translation.WaitAsync(token);
@@ -505,14 +511,17 @@ internal sealed class LookupTray : IDisposable
         }
         catch (Exception ex)
         {
-            Trace.TraceWarning("Amy 朗读结束（{0}）。", ex.GetType().Name);
+            var speech = ex as SpeechException;
+            var kind = speech?.Kind ?? SpeechFailureKind.SynthesisFailed;
+            SpeechDiagnostics._record("lookup-speech", kind, speech?.Code ?? ex.HResult);
             if (!_exiting && ReferenceEquals(_visibleResult, result) && _window is { IsVisible: true } window)
             {
-                string message = ex switch
+                string message = kind switch
                 {
-                    FileNotFoundException => "Amy 语音文件不完整，请使用完整发布包。",
-                    TimeoutException => "Amy 发音超时，可点击发音按钮重试。",
-                    _ => "无法播放 Amy 发音，可点击发音按钮重试。",
+                    SpeechFailureKind.BundleIncomplete => "Amy 语音文件不完整，请使用完整发布包。",
+                    SpeechFailureKind.SynthesisTimeout => "Amy 发音超时，可点击发音按钮重试。",
+                    SpeechFailureKind.AudioDeviceFailed => "无法访问音频输出设备，请检查扬声器或耳机后重试。",
+                    _ => "Amy 语音引擎异常，可点击发音按钮重试（详情见日志）。",
                 };
                 try
                 {

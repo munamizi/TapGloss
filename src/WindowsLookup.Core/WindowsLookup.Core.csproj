@@ -5,7 +5,18 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- 1.13.8 是最后保留 VITS 内置发音前端的稳定 NuGet 版本。 -->
+    <SherpaOnnxVersion>1.13.8</SherpaOnnxVersion>
+  </PropertyGroup>
   <ItemGroup>
+    <!-- 该托盘只发布 Windows x64。单独引用托管接口，避免还原其他平台的原生包。 -->
+    <PackageDownload Include="org.k2fsa.sherpa.onnx" Version="[$(SherpaOnnxVersion)]" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-x64" Version="[$(SherpaOnnxVersion)]" />
+    <Reference Include="sherpa-onnx">
+      <HintPath>$(NuGetPackageRoot)\org.k2fsa.sherpa.onnx\$(SherpaOnnxVersion)\lib\net10.0\sherpa-onnx.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
     <FrameworkReference Include="Microsoft.WindowsDesktop.App.WPF" />
   </ItemGroup>
 </Project>
