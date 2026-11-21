@@ -59,11 +59,3 @@ TapGloss 用 C# 和 .NET 10 编写，托盘菜单和译文浮窗使用 WinUI 3�
 1. **读取选区**。用 Windows UI Automation 读取当前应用选中的文字。遇到不支持直接读取的应用，会尝试通过临时复制取得选区。
 2. **翻译并显示**。将取得的文字交给 DeepSeek，按快捷键指定的方向取得译文，再在选区或光标附近显示浮窗。
 3. **本地朗读**。TapGloss 通过独立语音进程调用 sherpa-onnx，由 Amy 离线合成英文发音，再使用 Windows 当前默认设备播放。
-
-## 构建 Windows x64 发布包
-
-解压 [sherpa-onnx 官方 Amy 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-medium.tar.bz2)，把含 `tokens.txt` 和 `espeak-ng-data` 的目录传给 `AmyVoiceBundle`。本项目固定使用兼容内置发音前端的 sherpa-onnx 1.13.8。发布时会用生成的 `TapGloss.exe` 实际加载模型并合成测试音频。
-
-```powershell
-dotnet publish .\src\WindowsLookup.App\WindowsLookup.App.csproj -c Release --self-contained false "-p:AmyVoiceBundle=<解压后的模型目录>"
-```
