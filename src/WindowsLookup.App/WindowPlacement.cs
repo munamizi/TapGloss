@@ -3,7 +3,6 @@ using System.Runtime.InteropServices;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Windows.Graphics;
-using Forms = System.Windows.Forms;
 
 namespace WindowsLookup.App;
 
@@ -15,11 +14,11 @@ internal static class WindowPlacement
         ref int heightOffset, ref uint lastDpi, Rectangle? selectionBounds = null)
     {
         Point monitorPoint = selectionBounds is { } bounds ? new Point(bounds.Right - 1, bounds.Bottom - 1) : anchor;
-        Forms.Screen target = Forms.Screen.FromPoint(monitorPoint);
-        Rectangle screen = target.WorkingArea;
+        nint target = Win32Display._monitorForPoint(monitorPoint);
+        Rectangle screen = Win32Display._getWorkingArea(target);
         AppWindow appWindow = window.AppWindow;
         nint handle = WinRT.Interop.WindowNative.GetWindowHandle(window);
-        if (!target.Equals(Forms.Screen.FromHandle(handle)))
+        if (target != Win32Display._monitorForWindow(handle))
         {
             appWindow.Move(_position(screen, anchor, appWindow.Size, _getDpi(handle) / 96.0, centered, selectionBounds));
         }

@@ -1,8 +1,10 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Drawing;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
@@ -29,6 +31,10 @@ internal static class Program
                 case ["--unit", string directory]:
                     string fixture = _copyWorkerFixture(_testBundle(directory));
                     _testWordNormalization();
+                    _testSelectionRules();
+                    _testNativeWindows();
+                    _testDpapi(directory);
+                    await _testJobAsync();
                     byte[] wave = _testWave();
                     await _testRetryAsync();
                     await _testPlaybackAsync(wave);
@@ -38,7 +44,7 @@ internal static class Program
                     await _testWordPreparationAsync(fixture);
                     await _testSelectionLifetimeAsync(fixture);
                     _testDiagnostics(directory);
-                    Console.WriteLine("TapGloss 单元测试通过，含单词预合成、选区保活、waveOut 清理和管道取消回归。");
+                    Console.WriteLine("TapGloss 单元测试通过，含 Job、UIA、DPAPI、原生窗口和语音回归。");
                     return 0;
                 case ["--integration", string application]:
                     await _testWorkerAsync(Path.GetFullPath(application));
@@ -62,6 +68,12 @@ internal static class Program
                 case ["--speech-worker", string pipeName, string parent] when int.TryParse(parent, out int parentPid):
                     await _runPipeFixtureAsync(pipeName, parentPid);
                     return 0;
+                case ["--job-parent"]:
+                    await _runJobParentAsync();
+                    return 0;
+                case ["--job-child"]:
+                    await Task.Delay(Timeout.InfiniteTimeSpan);
+                    return 0;
                 case ["--selection-worker"]:
                     _runSelectionFixture();
                     return 0;
@@ -75,6 +87,158 @@ internal static class Program
             return 1;
         }
     }
+
+    // 验证扁平矩形、密码拦截、终端祖先补查及焦点变化的规则。
+    private static void _testSelectionRules()
+    {
+        _check(SelectionReader._lastVisibleBounds([10.5, 11.2, 40, 15]) == Rectangle.FromLTRB(10, 11, 51, 27),
+            "单行选区应按物理像素向外取整。");
+        _check(SelectionReader._lastVisibleBounds([1, 2, 3, 4, 8, 9, 10, 11, double.NaN, 1, 2, 3, 4, 5, -1, 6])
+            == new Rectangle(8, 9, 10, 11), "倒序跳过 NaN 和负宽度，使用最后的有效可见行。");
+        _check(SelectionReader._lastVisibleBounds([1, 2, 3, 4, 5]) is null
+            && SelectionReader._lastVisibleBounds([1, 2, 3, double.PositiveInfinity]) is null,
+            "不完整矩形和无穷边界应忽略。");
+
+        SelectionCapture terminal = SelectionReader._scanFocusChain("edit", _ => "xterm",
+            (node, _) => node == "xterm",
+            (node, _) => node == "edit" ? new(CaptureStatus.Selected, "sample") : null, () => true);
+        _check(terminal is { Status: CaptureStatus.Selected, IsTerminal: true },
+            "成功获取文本后仍要检查终端祖先。");
+        SelectionCapture empty = SelectionReader._scanFocusChain("edit", _ => "xterm",
+            (node, _) => node == "xterm", (_, _) => new(CaptureStatus.NoSelection), () => true);
+        _check(empty is { Status: CaptureStatus.Unavailable, FallbackMode: ClipboardFallbackMode.None },
+            "终端空选区不得转到自动剪贴板。");
+        SelectionCapture password = SelectionReader._scanFocusChain("edit", _ => null, (_, _) => false,
+            (_, _) => new(CaptureStatus.Protected), () => true);
+        _check(password is { Status: CaptureStatus.Protected, FallbackMode: ClipboardFallbackMode.None },
+            "密码控件应立即停止取词。");
+        SelectionCapture moved = SelectionReader._scanFocusChain("edit", _ => null, (_, _) => false,
+            (_, _) => new(CaptureStatus.Selected, "sample"), () => false);
+        _check(moved is { Status: CaptureStatus.Unavailable, Text: null },
+            "焦点更改后不能返回旧控件的文字。");
+        SelectionCapture tooLong = SelectionReader._scanFocusChain("edit", _ => null, (_, _) => false,
+            (_, _) => new(CaptureStatus.TooLong), () => true);
+        _check(tooLong is { Status: CaptureStatus.TooLong, FallbackMode: ClipboardFallbackMode.None },
+            "超出长度限制后不能转到自动剪贴板。");
+    }
+
+    // 用同一个文件验证旧 DPAPI 密文和当前存储的往返兼容。
+    private static void _testDpapi(string directory)
+    {
+        string path = Path.Combine(directory, Guid.NewGuid().ToString("N") + ".key");
+        const string fixture = "tapgloss-dpapi-fixture";
+        var store = new DeepSeekKeyStore(path);
+        try
+        {
+            File.WriteAllBytes(path, ProtectedData.Protect(Encoding.UTF8.GetBytes(fixture), null, DataProtectionScope.CurrentUser));
+            _check(store.Load() == fixture, "应能读取旧版 CurrentUser DPAPI 密文。");
+            store.Save(" " + fixture + " ");
+            _check(store.Load() == fixture
+                && Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(path), null, DataProtectionScope.CurrentUser)) == fixture,
+                "新密文应可往返，并可由旧版规则解密。");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    // 直接向测试窗口发送消息，并验证窗口、注册键和图标句柄可以释放。
+    private static void _testNativeWindows()
+    {
+        const uint verifyMessage = 0x8051;
+        foreach (bool messageOnly in new[] { true, false })
+        {
+            bool called = false;
+            using var window = new Win32MessageWindow(messageOnly, (message, wParam, lParam) =>
+            {
+                called = message == verifyMessage && wParam == 6 && lParam == 9;
+                return called;
+            });
+            nint handle = window.Handle;
+            _check(handle != 0 && _isWindow(handle), "应取得隐藏的原生窗口。");
+            _sendMessage(handle, verifyMessage, 6, 9);
+            _check(called, "原生消息应路由到窗口回调。");
+            window.Dispose();
+            _check(window.Handle == 0 && !_isWindow(handle), "销毁后应解除路由并清空窗口句柄。");
+        }
+
+        var keys = HotkeyModifiers.Control | HotkeyModifiers.Alt | HotkeyModifiers.Shift;
+        const HotkeyKey f24 = (HotkeyKey)0x87;
+        using (var first = new WindowsHotkey(keys, f24))
+        {
+            _check(first.Handle != 0, "应能注册原生热键。");
+        }
+        using var second = new WindowsHotkey(keys, f24);
+        using Stream data = typeof(Program).Assembly.GetManifestResourceStream("TapGloss.Verify.TrayIcon.ico")
+            ?? throw new InvalidOperationException("验证程序缺少托盘图标。");
+        using var bytes = new MemoryStream();
+        data.CopyTo(bytes);
+        nint icon = Win32TrayIcon._load(bytes.ToArray());
+        _check(icon != 0 && Win32TrayIcon._destroy(icon), "ICO 应生成可释放的原生图标。");
+    }
+
+    // 强制结束测试父进程，确认不监听父进程的测试子进程也会被内核回收。
+    private static async Task _testJobAsync()
+    {
+        _check(Marshal.SizeOf<ChildProcessJob.JobLimits>() == 144, "x64 Job 结构大小应为 144 字节。");
+        using Process parent = _startJobFixture("--job-parent");
+        Process? child = null;
+        try
+        {
+            string? line = await parent.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(8));
+            _check(int.TryParse(line, out int pid), "Job 创建、限制设置和进程分配应成功。");
+            child = Process.GetProcessById(pid);
+            _check(!child.HasExited, "父进程退出前，测试子进程应保持运行。");
+            parent.Kill();
+            await parent.WaitForExitAsync();
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            if (!parent.HasExited) parent.Kill();
+            if (child is not null)
+            {
+                if (!child.HasExited) child.Kill();
+                child.Dispose();
+            }
+        }
+    }
+
+    // 只在子进程成功加入 Job 后报告 PID。
+    private static async Task _runJobParentAsync()
+    {
+        using Process child = _startJobFixture("--job-child");
+        if (!ChildProcessJob._assign(child))
+        {
+            child.Kill();
+            throw new InvalidOperationException("测试子进程无法加入 Job。");
+        }
+        Console.WriteLine(child.Id);
+        await Task.Delay(Timeout.InfiniteTimeSpan);
+    }
+
+    // 使用验证程序自己的入口创建测试进程。
+    private static Process _startJobFixture(string mode)
+    {
+        var start = new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "TapGloss.Verify.exe"))
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+        };
+        start.ArgumentList.Add(mode);
+        return Process.Start(start) ?? throw new InvalidOperationException("无法启动 Job 验证进程。");
+    }
+
+    // 核对测试窗口句柄的生命周期。
+    [DllImport("user32.dll", EntryPoint = "IsWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool _isWindow(nint handle);
+
+    // 同线程发送测试消息。
+    [DllImport("user32.dll", EntryPoint = "SendMessageW", ExactSpelling = true)]
+    private static extern nint _sendMessage(nint window, uint message, nint wParam, nint lParam);
 
     // 每次只补齐一个缺失项，确认分类和文件名。
     private static string _testBundle(string directory)
@@ -374,7 +538,8 @@ internal static class Program
     private static string _copyWorkerFixture(string fixture)
     {
         foreach (string file in new[] { "TapGloss.Verify.exe", "TapGloss.Verify.dll", "TapGloss.Verify.deps.json",
-                     "TapGloss.Verify.runtimeconfig.json", "WindowsLookup.Core.dll" })
+                     "TapGloss.Verify.runtimeconfig.json", "WindowsLookup.Core.dll", "Interop.UIAutomationClient.dll",
+                     "System.Security.Cryptography.ProtectedData.dll" })
         {
             File.Copy(Path.Combine(AppContext.BaseDirectory, file), Path.Combine(fixture, file));
         }

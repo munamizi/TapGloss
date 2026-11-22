@@ -1,8 +1,8 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
-using Forms = System.Windows.Forms;
 
 namespace WindowsLookup.App;
 
@@ -50,8 +50,7 @@ internal static class Program
         using Mutex? instance = _claimInstance();
         if (instance is null)
         {
-            Forms.MessageBox.Show("查词工具已在系统托盘运行。", "TapGloss", Forms.MessageBoxButtons.OK,
-                Forms.MessageBoxIcon.Information);
+            _messageBox(0, "查词工具已在系统托盘运行。", "TapGloss", 0x40);
             return;
         }
         WinRT.ComWrappersSupport.InitializeComWrappers();
@@ -77,6 +76,10 @@ internal static class Program
             }
         }
     }
+
+    // 在第二个实例退出前显示原生提示。
+    [DllImport("user32.dll", EntryPoint = "MessageBoxW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int _messageBox(nint owner, string text, string title, uint style);
 
     // 保留旧版使用的命名锁协议，给正在退出的实例留出短暂时间释放最后一个句柄。
     private static Mutex? _claimInstance()

@@ -7,7 +7,6 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
-using Forms = System.Windows.Forms;
 
 namespace WindowsLookup.App;
 
@@ -166,7 +165,7 @@ internal sealed class TrayMenuWindow : Window
     // 在鼠标所在屏幕上显示透明锚点，保留 Windows 托盘的前台焦点。
     internal void _open(Point point)
     {
-        Rectangle workArea = Forms.Screen.FromPoint(point).WorkingArea;
+        Rectangle workArea = Win32Display._getWorkingArea(Win32Display._monitorForPoint(point));
         _flyout.Placement = point.Y >= workArea.Top + workArea.Height / 2
             ? FlyoutPlacementMode.Top
             : FlyoutPlacementMode.Bottom;
@@ -186,7 +185,7 @@ internal sealed class TrayMenuWindow : Window
             _outsideClicks._start();
             try
             {
-                _escape = new WindowsHotkey(0, Forms.Keys.Escape);
+                _escape = new WindowsHotkey(0, HotkeyKey.Escape);
                 _escape.Pressed += _ => _dismiss();
             }
             catch (Win32Exception)

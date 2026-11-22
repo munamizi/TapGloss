@@ -10,7 +10,7 @@
 
 ## 安装
 
-1. 在 x64 Windows 上安装 [.NET 10 Desktop Runtime（x64）](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) 和 [Windows App Runtime 2.6.5（x64）](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads#stable-release)。
+1. 在 x64 Windows 上安装 [.NET 10 Runtime（x64）](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) 和 [Windows App Runtime 2.6.5（x64）](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads#stable-release)。
 2. 在 [GitHub Releases](https://github.com/munamizi/TapGloss/releases) 的 **Assets** 下载 `TapGloss-win-x64.zip`。完整解压后会得到一个 `TapGloss` 文件夹，把整个文件夹放到常用位置，然后双击里面的 `TapGloss.exe`。
 3. 右键系统托盘中的应用图标，打开 **设置 API Key**，填入自己的 DeepSeek API Key。
 
@@ -54,8 +54,8 @@
 
 ## 架构
 
-TapGloss 用 C# 和 .NET 10 编写，托盘菜单和译文浮窗使用 WinUI 3。按下翻译快捷键后，程序按以下流程处理。
+TapGloss 用 C# 和 .NET 10 编写，托盘菜单和译文浮窗使用 WinUI 3，托盘图标和全局热键使用原生 Win32。发布版启用 ReadyToRun 预编译。主进程用 Windows Job Object 托管选区与语音子进程，异常退出时由系统回收。
 
-1. **读取选区**。用 Windows UI Automation 读取当前应用选中的文字。遇到不支持直接读取的应用，会尝试通过临时复制取得选区。
+1. **读取选区**。用原生 UI Automation 3.0 批量读取焦点控件的属性和模式，再取得选区。遇到不支持直接读取的应用，会尝试通过临时复制取得选区。
 2. **翻译并显示**。将取得的文字交给 DeepSeek，按快捷键指定的方向取得译文，再在选区或光标附近显示浮窗。
 3. **本地朗读**。TapGloss 通过独立语音进程调用 sherpa-onnx，由 Amy 离线合成英文发音，再使用 Windows 当前默认设备播放。

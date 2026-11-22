@@ -1,6 +1,5 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-using System.Windows.Forms;
 
 namespace WindowsLookup;
 
@@ -12,13 +11,23 @@ public enum HotkeyModifiers : uint
     Shift = 0x0004,
 }
 
+public enum HotkeyKey : uint
+{
+    T = 0x54,
+    R = 0x52,
+    Escape = 0x1b,
+}
+
 /// <summary>接收全局热键并记录触发瞬间的前台窗口。</summary>
-public sealed class WindowsHotkey : NativeWindow, IDisposable
+public sealed class WindowsHotkey : IDisposable
 {
     private const int HotkeyId = 1;
     private const int HotkeyMessage = 0x0312;
     private const uint NoRepeat = 0x4000;
     private const int AltKey = 0x12;
+    private readonly Win32MessageWindow _window;
+
+    public nint Handle => _window.Handle;
 
     /// <summary>
     /// 在调用线程的消息循环上注册全局快捷键。
@@ -29,13 +38,13 @@ public sealed class WindowsHotkey : NativeWindow, IDisposable
     /// Returns:
     ///     WindowsHotkey - 已注册热键的消息窗口，冲突时抛出 Win32Exception
     /// </summary>
-    public WindowsHotkey(HotkeyModifiers modifiers = HotkeyModifiers.Alt, Keys key = Keys.T)
+    public WindowsHotkey(HotkeyModifiers modifiers = HotkeyModifiers.Alt, HotkeyKey key = HotkeyKey.T)
     {
-        CreateHandle(new CreateParams { Parent = new IntPtr(-3) });
+        _window = new Win32MessageWindow(messageOnly: true, _onMessage);
         if (!_registerHotKey(Handle, HotkeyId, (uint)modifiers | NoRepeat, (uint)key))
         {
             int error = Marshal.GetLastPInvokeError();
-            DestroyHandle();
+            _window.Dispose();
             throw new Win32Exception(error);
         }
     }
@@ -56,34 +65,27 @@ public sealed class WindowsHotkey : NativeWindow, IDisposable
         if (Handle != 0)
         {
             _unregisterHotKey(Handle, HotkeyId);
-            DestroyHandle();
+            _window.Dispose();
         }
     }
 
-    /// <summary>
-    /// 转发注册的热键消息。
-    ///
-    /// Args:
-    ///     message - Windows 传给该消息窗口的消息
-    /// Returns:
-    ///     无返回值，收到注册热键时先抑制单按 Alt 的菜单行为，再触发 Pressed。
-    /// </summary>
-    protected override void WndProc(ref Message message)
+    // 先处理 Alt 菜单状态，再将已注册的热键交给订阅者。
+    private bool _onMessage(uint message, nint wParam, nint lParam)
     {
-        if (message.Msg == HotkeyMessage && message.WParam == HotkeyId)
+        if (message != HotkeyMessage || wParam != HotkeyId)
         {
-            nint sourceWindow = _getForegroundWindow();
-            var modifiers = (HotkeyModifiers)(message.LParam.ToInt64() & 0xffff);
-            if (sourceWindow != 0 && _tryGetFocusState(sourceWindow, out _, out bool inMenu)
-                && _getForegroundWindow() == sourceWindow
-                && _shouldMaskAlt(modifiers, ClipboardFallback._isPressed(AltKey), inMenu))
-            {
-                ClipboardFallback._maskAltMenu();
-            }
-            Pressed?.Invoke(sourceWindow);
-            return;
+            return false;
         }
-        base.WndProc(ref message);
+        nint sourceWindow = _getForegroundWindow();
+        var modifiers = (HotkeyModifiers)(lParam.ToInt64() & 0xffff);
+        if (sourceWindow != 0 && _tryGetFocusState(sourceWindow, out _, out bool inMenu)
+            && _getForegroundWindow() == sourceWindow
+            && _shouldMaskAlt(modifiers, ClipboardFallback._isPressed(AltKey), inMenu))
+        {
+            ClipboardFallback._maskAltMenu();
+        }
+        Pressed?.Invoke(sourceWindow);
+        return true;
     }
 
     // Alt 仍按下且菜单未激活时才有机会阻止菜单行为。

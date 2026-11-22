@@ -133,6 +133,7 @@ internal sealed class SelectionAutomationWorker : IDisposable
         };
         start.ArgumentList.Add("--selection-worker");
         _process = Process.Start(start) ?? throw new IOException("无法启动选区读取进程。");
+        ChildProcessJob._assign(_process);
         return _process;
     }
 

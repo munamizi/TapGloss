@@ -16,7 +16,8 @@
     <AssemblyName>TapGloss</AssemblyName>
     <AssemblyTitle>TapGloss</AssemblyTitle>
     <Product>TapGloss</Product>
-    <Version>0.5.16</Version>
+    <Version>0.5.17</Version>
+    <PublishReadyToRun>true</PublishReadyToRun>
     <Description>TapGloss</Description>
     <AmyVoiceBundle Condition="'$(AmyVoiceBundle)' == ''">$(PiperVoiceBundle)</AmyVoiceBundle>
   </PropertyGroup>

@@ -1,7 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Windows.Automation;
-using System.Windows.Automation.Text;
+using Interop.UIAutomationClient;
 
 namespace WindowsLookup;
 
@@ -48,6 +47,16 @@ public sealed record SelectionCapture(CaptureStatus Status, string? Text = null,
 public sealed class SelectionReader : IDisposable
 {
     public const int MaxTextLength = 1000;
+    private const int ControlTypeProperty = 30003;
+    private const int NameProperty = 30005;
+    private const int ClassNameProperty = 30012;
+    private const int IsPasswordProperty = 30019;
+    private const int IsTextPatternAvailableProperty = 30040;
+    private const int TextPatternId = 10014;
+    private const int EditControlType = 50004;
+    private const int ElementNotAvailable = unchecked((int)0x80040201);
+    private static readonly Lazy<(IUIAutomation2 Client, IUIAutomationCacheRequest Cache, IUIAutomationTreeWalker Walker)>
+        Automation = new(_createAutomation);
     private readonly SemaphoreSlim _captureGate = new(1);
     private readonly SemaphoreSlim _automationGate = new(1);
     private readonly SelectionAutomationWorker? _worker;
@@ -250,44 +259,95 @@ public sealed class SelectionReader : IDisposable
         }
     }
 
-    // 让 UIA 在子进程发出就绪信号前加载，单次预算留给实际的来源控件读取。
+    // 在 MTA 中共用自动化客户端、缓存请求和祖先遍历器。
+    private static (IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationTreeWalker) _createAutomation()
+    {
+        var client = (IUIAutomation2)new CUIAutomation8();
+        client.ConnectionTimeout = 500;
+        client.TransactionTimeout = 800;
+        IUIAutomationCacheRequest cache = client.CreateCacheRequest();
+        cache.AutomationElementMode = AutomationElementMode.AutomationElementMode_Full;
+        cache.TreeScope = TreeScope.TreeScope_Element;
+        cache.AddProperty(ControlTypeProperty);
+        cache.AddProperty(NameProperty);
+        cache.AddProperty(ClassNameProperty);
+        cache.AddProperty(IsPasswordProperty);
+        cache.AddProperty(IsTextPatternAvailableProperty);
+        cache.AddPattern(TextPatternId);
+        return (client, cache, client.ControlViewWalker);
+    }
+
+    // 先加载 UIA 并访问桌面根元素，把取词预算留给来源控件。
     internal static void _prepareAutomation()
     {
         try
         {
-            _ = AutomationElement.RootElement;
+            _releaseAutomationObject(Automation.Value.Client.GetRootElement());
         }
-        catch (Exception ex) when (ex is COMException or ElementNotAvailableException)
+        catch (Exception error) when (error is COMException or InvalidOperationException)
         {
-            // 桌面暂不可读时仍可送出就绪信号，随后按实际控件的读取结果处理。
+            // 桌面暂不可读时仍发出就绪信号，随后按实际控件处理。
         }
     }
 
-    // 读取焦点控件的选区，并沿祖先识别终端。
+    // 批量读取焦点与祖先缓存，只在使用期内持有本次的 COM 代理。
     internal static SelectionCapture _readSelection(nint sourceWindow)
     {
+        var elements = new List<IUIAutomationElement>();
         try
         {
-            AutomationElement? focused = AutomationElement.FocusedElement;
+            var (client, cache, walker) = Automation.Value;
+            IUIAutomationElement? focused = _track(client.GetFocusedElementBuildCache(cache));
             if (focused is null)
             {
                 return _automationUnavailable(null);
             }
-
             bool numberedTerminalName = ClipboardFallback._isVsCodeEditor(sourceWindow);
-            return _scanFocusChain(focused, element => TreeWalker.ControlViewWalker.GetParent(element),
+            return _scanFocusChain(focused, element => _track(walker.GetParentElementBuildCache(element, cache)),
                 (element, depth) => _isAutomationTerminal(element, depth == 0, numberedTerminalName),
-                _readAutomationElement,
-                () => sourceWindow == WindowsHotkey._getForegroundWindow()
-                    && Equals(focused, AutomationElement.FocusedElement));
+                _readAutomationElement, () =>
+                {
+                    if (sourceWindow != WindowsHotkey._getForegroundWindow())
+                    {
+                        return false;
+                    }
+                    IUIAutomationElement? current = _track(client.GetFocusedElement());
+                    return current is not null && client.CompareElements(focused, current) != 0;
+                });
         }
-        catch (ElementNotAvailableException)
+        catch (Exception error) when (error is COMException or InvalidOperationException)
         {
-            return _automationUnavailable("来源控件已关闭或切换。");
+            return _automationUnavailable(_automationErrorDetail(error));
         }
-        catch (Exception ex) when (ex is COMException or InvalidOperationException)
+        finally
         {
-            return _automationUnavailable("来源应用的选区接口不可访问。");
+            for (int index = elements.Count - 1; index >= 0; index--)
+            {
+                _releaseAutomationObject(elements[index]);
+            }
+        }
+
+        // 记录每次从 COM 接口取得的引用，供读取结束时逐一释放。
+        IUIAutomationElement? _track(IUIAutomationElement? element)
+        {
+            if (element is not null)
+            {
+                elements.Add(element);
+            }
+            return element;
+        }
+    }
+
+    // UIA 统一通过 COM 错误码区分控件失效与接口不可访问。
+    private static string _automationErrorDetail(Exception error) => error.HResult == ElementNotAvailable
+        ? "来源控件已关闭或切换。" : "来源应用的选区接口不可访问。";
+
+    // 只释放本次 UIA 调用取得的 COM 对象引用。
+    private static void _releaseAutomationObject(object? value)
+    {
+        if (value is not null)
+        {
+            Marshal.ReleaseComObject(value);
         }
     }
 
@@ -334,7 +394,7 @@ public sealed class SelectionReader : IDisposable
                                 terminal = isTerminal(element, ancestorDepth);
                             }
                         }
-                        catch (Exception ex) when (ex is COMException or ElementNotAvailableException or InvalidOperationException)
+                        catch (Exception ex) when (ex is COMException or InvalidOperationException)
                         {
                             // 已读取选区时保留文本，粘贴前仍会检查当时可访问的焦点与祖先。
                         }
@@ -360,63 +420,104 @@ public sealed class SelectionReader : IDisposable
                 ? new(CaptureStatus.NoSelection) { AutomationFocusChecked = true }
                 : _automationUnavailable(null) with { AutomationFocusChecked = true };
         }
-        catch (Exception ex) when (ex is COMException or ElementNotAvailableException or InvalidOperationException)
+        catch (Exception ex) when (ex is COMException or InvalidOperationException)
         {
             if (terminal)
             {
                 return _terminalNeedsSelection();
             }
-            string detail = ex is ElementNotAvailableException
-                ? "来源控件已关闭或切换。" : "来源应用的选区接口不可访问。";
+            string detail = _automationErrorDetail(ex);
             return emptySelection || selectionRead ? new(CaptureStatus.Unavailable, Detail: detail) : _automationUnavailable(detail);
         }
     }
 
-    // 先检查受保护控件，再读取首个可用文本控件的选区和末尾位置。
-    private static SelectionCapture? _readAutomationElement(AutomationElement element, bool readText)
+    // 先核对密码属性，再通过缓存的 TextPattern 读取选区文本和位置。
+    private static SelectionCapture? _readAutomationElement(IUIAutomationElement element, bool readText)
     {
-        if (element.Current.IsPassword)
+        if (element.CachedIsPassword != 0)
         {
             return new(CaptureStatus.Protected, Detail: "此控件包含受保护文本。");
         }
-        if (!readText || !element.TryGetCurrentPattern(TextPattern.Pattern, out object pattern)
-            || pattern is not TextPattern textPattern
-            || textPattern.SupportedTextSelection == SupportedTextSelection.None)
+        if (!readText || element.GetCachedPropertyValue(IsTextPatternAvailableProperty) is not true)
         {
             return null;
         }
 
-        var selected = new StringBuilder();
-        TextPatternRange? lastRange = null;
-        foreach (var range in textPattern.GetSelection())
+        object? pattern = element.GetCachedPattern(TextPatternId);
+        IUIAutomationTextRangeArray? selection = null;
+        try
         {
-            string part = range.GetText(MaxTextLength + 1);
-            if (part.Length == 0)
+            if (pattern is not IUIAutomationTextPattern textPattern
+                || textPattern.SupportedTextSelection == SupportedTextSelection.SupportedTextSelection_None)
             {
-                continue;
+                return null;
             }
-            if (selected.Length > 0)
+            selection = textPattern.GetSelection();
+            if (selection is null)
             {
-                selected.Append('\n');
+                return new(CaptureStatus.NoSelection);
             }
-            if (selected.Length + part.Length > MaxTextLength)
-            {
-                return new(CaptureStatus.TooLong, Detail: "一次最多处理 1000 个字符。");
-            }
-            selected.Append(part);
-            lastRange = range;
+            return _readRanges(selection);
         }
-        string text = selected.ToString().Trim();
-        return text.Length == 0 ? new(CaptureStatus.NoSelection)
-            : new(CaptureStatus.Selected, text) { SelectionBounds = _readSelectionBounds(lastRange!) };
+        finally
+        {
+            _releaseAutomationObject(selection);
+            _releaseAutomationObject(pattern);
+        }
     }
 
-    // 仅在焦点是输入控件时读取终端标签，祖先通过已知的组件类名识别。
-    private static bool _isAutomationTerminal(AutomationElement element, bool focused, bool numberedTerminalName)
+    // 按原顺序拼接选区，保留最后一个含文字的范围用于浮窗定位。
+    private static SelectionCapture _readRanges(IUIAutomationTextRangeArray selection)
     {
-        var properties = element.Current;
-        bool isEdit = focused && properties.ControlType == ControlType.Edit;
-        return _matchesTerminalControl(properties.ClassName, isEdit ? properties.Name : "", isEdit, numberedTerminalName);
+        var selected = new StringBuilder();
+        IUIAutomationTextRange? lastRange = null;
+        try
+        {
+            int length = selection.Length;
+            for (int index = 0; index < length; index++)
+            {
+                IUIAutomationTextRange? range = selection.GetElement(index);
+                try
+                {
+                    string part = range?.GetText(MaxTextLength + 1) ?? "";
+                    if (part.Length == 0)
+                    {
+                        continue;
+                    }
+                    if (selected.Length > 0)
+                    {
+                        selected.Append('\n');
+                    }
+                    if (selected.Length + part.Length > MaxTextLength)
+                    {
+                        return new(CaptureStatus.TooLong, Detail: "一次最多处理 1000 个字符。");
+                    }
+                    selected.Append(part);
+                    _releaseAutomationObject(lastRange);
+                    lastRange = range;
+                    range = null;
+                }
+                finally
+                {
+                    _releaseAutomationObject(range);
+                }
+            }
+            string text = selected.ToString().Trim();
+            return text.Length == 0 ? new(CaptureStatus.NoSelection)
+                : new(CaptureStatus.Selected, text) { SelectionBounds = _readSelectionBounds(lastRange!) };
+        }
+        finally
+        {
+            _releaseAutomationObject(lastRange);
+        }
+    }
+
+    // 只在焦点是输入控件时读取终端标签，祖先按组件类名识别。
+    private static bool _isAutomationTerminal(IUIAutomationElement element, bool focused, bool numberedTerminalName)
+    {
+        bool isEdit = focused && element.CachedControlType == EditControlType;
+        return _matchesTerminalControl(element.CachedClassName ?? "", isEdit ? element.CachedName ?? "" : "",
+            isEdit, numberedTerminalName);
     }
 
     // 匹配终端组件类和输入框标签，编号形式只用于已知的 VS Code 系进程。
@@ -463,27 +564,41 @@ public sealed class SelectionReader : IDisposable
     internal static SelectionCapture _automationUnavailable(string? detail) =>
         new(CaptureStatus.Unavailable, Detail: detail) { FallbackMode = ClipboardFallbackMode.Automatic };
 
-    // 取选区最后一条可见行的物理像素边界，供浮窗贴近选区末尾。
-    private static System.Drawing.Rectangle? _readSelectionBounds(TextPatternRange range)
+    // 无法定位时仍保留已读取的文字。
+    private static System.Drawing.Rectangle? _readSelectionBounds(IUIAutomationTextRange range)
     {
         try
         {
-            var rectangles = range.GetBoundingRectangles();
-            for (int index = rectangles.Length - 1; index >= 0; index--)
-            {
-                var bounds = rectangles[index];
-                if (bounds.Width > 0 && bounds.Height > 0
-                    && double.IsFinite(bounds.Left) && double.IsFinite(bounds.Top)
-                    && double.IsFinite(bounds.Right) && double.IsFinite(bounds.Bottom))
-                {
-                    return System.Drawing.Rectangle.FromLTRB(
-                        (int)Math.Floor(bounds.Left), (int)Math.Floor(bounds.Top),
-                        (int)Math.Ceiling(bounds.Right), (int)Math.Ceiling(bounds.Bottom));
-                }
-            }
+            return _lastVisibleBounds(range.GetBoundingRectangles());
         }
-        catch (Exception error) when (error is ElementNotAvailableException or COMException or InvalidOperationException)
+        catch (Exception error) when (error is COMException or InvalidOperationException)
         {
+            return null;
+        }
+    }
+
+    // 每四个值构成一个物理像素矩形，从最后一条有效可见行开始查找。
+    internal static System.Drawing.Rectangle? _lastVisibleBounds(double[]? rectangles)
+    {
+        if (rectangles is null || rectangles.Length < 4 || rectangles.Length % 4 != 0)
+        {
+            return null;
+        }
+
+        for (int index = rectangles.Length - 4; index >= 0; index -= 4)
+        {
+            double left = Math.Floor(rectangles[index]);
+            double top = Math.Floor(rectangles[index + 1]);
+            double width = rectangles[index + 2];
+            double height = rectangles[index + 3];
+            double right = Math.Ceiling(rectangles[index] + width);
+            double bottom = Math.Ceiling(rectangles[index + 1] + height);
+            if (width > 0 && height > 0 && left >= int.MinValue && top >= int.MinValue
+                && right <= int.MaxValue && bottom <= int.MaxValue
+                && right > left && bottom > top && right - left <= int.MaxValue && bottom - top <= int.MaxValue)
+            {
+                return System.Drawing.Rectangle.FromLTRB((int)left, (int)top, (int)right, (int)bottom);
+            }
         }
         return null;
     }

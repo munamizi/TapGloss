@@ -222,6 +222,7 @@ internal sealed class AmySpeechClient : IDisposable
             {
                 throw new InvalidOperationException("未能启动 Amy 子进程。");
             }
+            ChildProcessJob._assign(worker.Process);
             worker.Process.BeginErrorReadLine();
             worker.Process.BeginOutputReadLine();
             await worker.Pipe.WaitForConnectionAsync(deadline.Token).ConfigureAwait(false);

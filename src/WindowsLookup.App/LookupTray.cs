@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Forms = System.Windows.Forms;
 
 namespace WindowsLookup.App;
 
@@ -51,8 +50,8 @@ internal sealed class LookupTray : IDisposable
     internal LookupTray()
     {
         var shortcutErrors = new List<string>(2);
-        _chineseHotkey = _tryRegisterHotkey(Forms.Keys.T, TranslationDirection.ToChinese, shortcutErrors);
-        _englishHotkey = _tryRegisterHotkey(Forms.Keys.R, TranslationDirection.ToEnglish, shortcutErrors);
+        _chineseHotkey = _tryRegisterHotkey(HotkeyKey.T, TranslationDirection.ToChinese, shortcutErrors);
+        _englishHotkey = _tryRegisterHotkey(HotkeyKey.R, TranslationDirection.ToEnglish, shortcutErrors);
         try
         {
             _apiKey = _keys.Load();
@@ -95,7 +94,7 @@ internal sealed class LookupTray : IDisposable
     }
 
     // 一次只注册一个方向，冲突只影响该快捷键。
-    private WindowsHotkey? _tryRegisterHotkey(Forms.Keys key, TranslationDirection direction, List<string> errors)
+    private WindowsHotkey? _tryRegisterHotkey(HotkeyKey key, TranslationDirection direction, List<string> errors)
     {
         try
         {
@@ -160,7 +159,7 @@ internal sealed class LookupTray : IDisposable
         nint sourceFocus = WindowsHotkey.GetFocusedWindow(sourceWindow);
         Guid desktopId = VirtualDesktop._getDesktopId(sourceWindow);
         _lookupTask = _runLookupAsync(request, sourceWindow, sourceFocus,
-            clipboardWindow, Forms.Cursor.Position, desktopId, direction);
+            clipboardWindow, Win32Display._getCursorPosition(), desktopId, direction);
     }
 
     // 从本次来源取词，异步查询模型并更新浮窗。
@@ -609,7 +608,7 @@ internal sealed class LookupTray : IDisposable
             _settingsWindow = dialog;
             dialog._setSaveEnabled(false);
             key.PasswordChanged += (_, _) => dialog._setSaveEnabled(!string.IsNullOrWhiteSpace(key.Password));
-            await dialog._showAsync(Forms.Cursor.Position, 184);
+            await dialog._showAsync(Win32Display._getCursorPosition(), 184);
         }
         finally
         {

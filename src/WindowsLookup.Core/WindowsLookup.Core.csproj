@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
@@ -17,6 +16,7 @@
       <HintPath>$(NuGetPackageRoot)\org.k2fsa.sherpa.onnx\$(SherpaOnnxVersion)\lib\net10.0\sherpa-onnx.dll</HintPath>
       <Private>true</Private>
     </Reference>
-    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WPF" />
+    <PackageReference Include="Interop.UIAutomationClient" Version="10.19041.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.15" />
   </ItemGroup>
 </Project>

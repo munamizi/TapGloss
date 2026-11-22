@@ -11,5 +11,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/WindowsLookup.Core/WindowsLookup.Core.csproj" />
+    <EmbeddedResource Include="../../src/WindowsLookup.App/Assets/WindowsLookup.ico" LogicalName="TapGloss.Verify.TrayIcon.ico" />
   </ItemGroup>
 </Project>
